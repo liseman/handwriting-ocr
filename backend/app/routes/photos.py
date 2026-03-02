@@ -1,4 +1,12 @@
-"""Google Photos integration -- list albums, list items, import into documents."""
+"""Google Photos Picker API integration.
+
+The old Library API scopes (photoslibrary.readonly) were removed in March 2025.
+This module uses the Photos Picker API instead:
+1. Backend creates a picker session
+2. Frontend opens the pickerUri for the user to select photos
+3. Frontend polls the session until the user finishes
+4. Backend fetches the selected media items and imports them
+"""
 
 import os
 import uuid
@@ -6,7 +14,8 @@ from typing import List, Optional
 
 import aiofiles
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -15,36 +24,45 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models import Document, Page, User
-from app.schemas import (
-    DocumentOut,
-    GoogleAlbum,
-    GoogleMediaItem,
-    MessageResponse,
-    PhotoImportRequest,
-    PhotoImportResponse,
-)
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 
-GOOGLE_PHOTOS_API = "https://photoslibrary.googleapis.com/v1"
+PICKER_API = "https://photospicker.googleapis.com/v1"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Schemas ──────────────────────────────────────────────────────────────────
 
 
-def _get_google_token(request: Request) -> str:
-    """Extract the Google access token from the session.
+class PickerSessionResponse(BaseModel):
+    session_id: str
+    picker_uri: str
 
-    The token is stored during the OAuth callback so we can call Google
-    APIs on behalf of the user without re-authenticating.
-    """
-    token: Optional[str] = request.session.get("google_access_token")
-    if not token:
+
+class PickerPollResponse(BaseModel):
+    ready: bool
+    media_items_count: int = 0
+
+
+class PickerImportRequest(BaseModel):
+    session_id: str
+    document_name: str = "Google Photos Import"
+
+
+class PickerImportResponse(BaseModel):
+    document_id: int
+    imported_count: int
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _get_google_token(user: User) -> str:
+    if not user.google_access_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Google Photos access token not available. Please re-authenticate.",
+            detail="Google access token not available. Please sign out and sign back in.",
         )
-    return token
+    return user.google_access_token
 
 
 def _user_upload_dir(user_id: int) -> str:
@@ -53,187 +71,115 @@ def _user_upload_dir(user_id: int) -> str:
     return path
 
 
-async def _download_image(url: str, dest: str) -> None:
-    """Download an image from *url* and save it to *dest*."""
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        async with aiofiles.open(dest, "wb") as f:
-            await f.write(resp.content)
+# ── Endpoints ────────────────────────────────────────────────────────────────
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+@router.post("/picker/session", response_model=PickerSessionResponse)
+async def create_picker_session(
+    current_user: User = Depends(get_current_user),
+) -> PickerSessionResponse:
+    """Create a Google Photos Picker session.
 
-
-@router.get("/albums", response_model=List[GoogleAlbum])
-async def list_albums(
-    request: Request,
-    page_size: int = Query(default=50, ge=1, le=50),
-    page_token: Optional[str] = Query(default=None),
-    _current_user: User = Depends(get_current_user),
-) -> list:
-    """List the authenticated user's Google Photos albums."""
-    token = _get_google_token(request)
-
-    params: dict = {"pageSize": page_size}
-    if page_token:
-        params["pageToken"] = page_token
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{GOOGLE_PHOTOS_API}/albums",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-        )
-
-    if resp.status_code == 401:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Google access token expired. Please re-authenticate.",
-        )
-    resp.raise_for_status()
-
-    data = resp.json()
-    albums_raw = data.get("albums", [])
-
-    return [
-        GoogleAlbum(
-            id=a["id"],
-            title=a.get("title", "Untitled"),
-            media_items_count=int(a.get("mediaItemsCount", 0)) if a.get("mediaItemsCount") else None,
-            cover_photo_url=a.get("coverPhotoBaseUrl"),
-        )
-        for a in albums_raw
-    ]
-
-
-@router.get("/albums/{album_id}/items", response_model=List[GoogleMediaItem])
-async def list_album_items(
-    album_id: str,
-    request: Request,
-    page_size: int = Query(default=50, ge=1, le=100),
-    page_token: Optional[str] = Query(default=None),
-    _current_user: User = Depends(get_current_user),
-) -> list:
-    """List media items in a specific Google Photos album."""
-    token = _get_google_token(request)
-
-    body: dict = {
-        "albumId": album_id,
-        "pageSize": page_size,
-    }
-    if page_token:
-        body["pageToken"] = page_token
+    Returns a picker_uri that the frontend should open for the user
+    to select photos.
+    """
+    token = _get_google_token(current_user)
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{GOOGLE_PHOTOS_API}/mediaItems:search",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=body,
+            f"{PICKER_API}/sessions",
+            headers={"Authorization": f"Bearer {token}"},
         )
 
-    if resp.status_code == 401:
+    if resp.status_code in (401, 403):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Google access token expired. Please re-authenticate.",
+            detail="Google Photos access denied. Please sign out and sign back in.",
         )
     resp.raise_for_status()
 
     data = resp.json()
-    items_raw = data.get("mediaItems", [])
+    return PickerSessionResponse(
+        session_id=data["id"],
+        picker_uri=data["pickerUri"],
+    )
 
-    return [
-        GoogleMediaItem(
-            id=item["id"],
-            filename=item.get("filename", "unknown"),
-            mime_type=item.get("mimeType", "image/jpeg"),
-            base_url=item.get("baseUrl", ""),
-            width=int(item["mediaMetadata"]["width"]) if "mediaMetadata" in item and "width" in item["mediaMetadata"] else None,
-            height=int(item["mediaMetadata"]["height"]) if "mediaMetadata" in item and "height" in item["mediaMetadata"] else None,
+
+@router.get("/picker/session/{session_id}", response_model=PickerPollResponse)
+async def poll_picker_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+) -> PickerPollResponse:
+    """Poll a picker session to check if the user has finished selecting photos."""
+    token = _get_google_token(current_user)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            f"{PICKER_API}/sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
         )
-        for item in items_raw
-        if item.get("mimeType", "").startswith("image/")
-    ]
+
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail="Google token expired.")
+    resp.raise_for_status()
+
+    data = resp.json()
+    media_set = data.get("mediaItemsSet", False)
+
+    return PickerPollResponse(
+        ready=media_set,
+        media_items_count=0,  # count is not available until we list items
+    )
 
 
-@router.post("/import", response_model=PhotoImportResponse)
-async def import_photos(
-    body: PhotoImportRequest,
-    request: Request,
+@router.post("/picker/import", response_model=PickerImportResponse)
+async def import_from_picker(
+    body: PickerImportRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> PhotoImportResponse:
-    """Import selected photos (or an entire album) as a new Document.
+) -> PickerImportResponse:
+    """Import the photos selected in a picker session as a new document."""
+    token = _get_google_token(current_user)
 
-    Either ``media_item_ids`` or ``album_id`` must be provided.  If
-    ``album_id`` is given without ``media_item_ids``, all images in the
-    album are imported.
-    """
-    token = _get_google_token(request)
+    # List all selected media items from the session.
+    all_items = []
+    page_token: Optional[str] = None
 
-    if not body.media_item_ids and not body.album_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide either media_item_ids or album_id.",
-        )
+    async with httpx.AsyncClient(timeout=60) as client:
+        while True:
+            params = {"sessionId": body.session_id, "pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
 
-    items_to_download: list[dict] = []
+            resp = await client.get(
+                f"{PICKER_API}/mediaItems",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
 
-    if body.media_item_ids:
-        # Fetch metadata for specific items via batchGet.
-        async with httpx.AsyncClient(timeout=30) as client:
-            # The API accepts up to 50 item IDs per call.
-            for i in range(0, len(body.media_item_ids), 50):
-                chunk = body.media_item_ids[i : i + 50]
-                params = [("mediaItemIds", mid) for mid in chunk]
-                resp = await client.get(
-                    f"{GOOGLE_PHOTOS_API}/mediaItems:batchGet",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params=params,
-                )
-                if resp.status_code == 401:
-                    raise HTTPException(status_code=401, detail="Google token expired.")
-                resp.raise_for_status()
-                for result in resp.json().get("mediaItemResults", []):
-                    item = result.get("mediaItem")
-                    if item and item.get("mimeType", "").startswith("image/"):
-                        items_to_download.append(item)
+            if resp.status_code in (401, 403):
+                raise HTTPException(status_code=401, detail="Google token expired.")
+            resp.raise_for_status()
 
-    elif body.album_id:
-        # Iterate through the entire album.
-        next_token: Optional[str] = None
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                req_body: dict = {"albumId": body.album_id, "pageSize": 100}
-                if next_token:
-                    req_body["pageToken"] = next_token
-                resp = await client.post(
-                    f"{GOOGLE_PHOTOS_API}/mediaItems:search",
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                    json=req_body,
-                )
-                if resp.status_code == 401:
-                    raise HTTPException(status_code=401, detail="Google token expired.")
-                resp.raise_for_status()
-                data = resp.json()
-                for item in data.get("mediaItems", []):
-                    if item.get("mimeType", "").startswith("image/"):
-                        items_to_download.append(item)
-                next_token = data.get("nextPageToken")
-                if not next_token:
-                    break
+            data = resp.json()
+            for item in data.get("mediaItems", []):
+                media_file = item.get("mediaFile", {})
+                mime = media_file.get("mimeType", "")
+                if mime.startswith("image/"):
+                    all_items.append({
+                        "id": item.get("id"),
+                        "base_url": media_file.get("baseUrl", ""),
+                        "filename": media_file.get("filename", "photo.jpg"),
+                        "mime_type": mime,
+                    })
 
-    if not items_to_download:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No images found to import.",
-        )
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+    if not all_items:
+        raise HTTPException(status_code=404, detail="No images found in picker selection.")
 
     # Create document.
     document = Document(
@@ -245,42 +191,77 @@ async def import_photos(
     await db.flush()
 
     upload_dir = _user_upload_dir(current_user.id)
+    imported = 0
 
-    for idx, item in enumerate(items_to_download):
-        base_url = item.get("baseUrl", "")
-        # Append =d to get the full-resolution download.
-        download_url = f"{base_url}=d"
+    async with httpx.AsyncClient(timeout=60) as client:
+        for idx, item in enumerate(all_items):
+            # baseUrl from Picker API is valid for 60 minutes.
+            # Append =d to download the original full-resolution image.
+            download_url = item["base_url"]
+            if not download_url:
+                continue
+            if "=" not in download_url.split("/")[-1]:
+                download_url += "=d"
 
-        filename = item.get("filename", f"photo_{idx}.jpg")
-        ext = os.path.splitext(filename)[1].lower() or ".jpg"
-        unique_name = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(upload_dir, unique_name)
+            ext = os.path.splitext(item["filename"])[1].lower() or ".jpg"
+            unique_name = f"{uuid.uuid4().hex}{ext}"
+            dest = os.path.join(upload_dir, unique_name)
 
-        try:
-            await _download_image(download_url, dest)
-        except httpx.HTTPError:
-            # Skip items that fail to download.
-            continue
+            try:
+                resp = await client.get(
+                    download_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                resp.raise_for_status()
+                async with aiofiles.open(dest, "wb") as f:
+                    await f.write(resp.content)
+            except httpx.HTTPError:
+                continue
 
-        page = Page(
-            document_id=document.id,
-            image_path=dest,
-            page_number=idx + 1,
-        )
-        db.add(page)
+            # Convert HEIC/HEIF to JPEG so browsers can display them
+            if ext in (".heic", ".heif"):
+                from app.routes.documents import _convert_heic_to_jpeg
+                dest = _convert_heic_to_jpeg(dest)
+            else:
+                from app.routes.documents import _bake_exif_rotation
+                _bake_exif_rotation(dest)
+
+            page = Page(
+                document_id=document.id,
+                image_path=dest,
+                page_number=idx + 1,
+            )
+            db.add(page)
+            imported += 1
 
     await db.flush()
 
-    # Reload with pages.
-    stmt = (
+    # Auto-trigger OCR on all imported pages.
+    from app.routes.ocr import _run_ocr_on_page
+    from sqlalchemy.orm import selectinload as _sl
+    re_stmt = (
         select(Document)
-        .options(selectinload(Document.pages))
+        .options(_sl(Document.pages))
         .where(Document.id == document.id)
     )
-    result = await db.execute(stmt)
-    doc = result.scalar_one()
+    re_result = await db.execute(re_stmt)
+    doc_reloaded = re_result.scalar_one()
+    for pg in doc_reloaded.pages:
+        pg.processing_status = "processing"
+        background_tasks.add_task(_run_ocr_on_page, pg.id, current_user.id)
+    await db.flush()
 
-    return PhotoImportResponse(
-        document=DocumentOut.model_validate(doc),
-        imported_count=len(doc.pages),
+    # Clean up the picker session.
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(
+                f"{PICKER_API}/sessions/{body.session_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception:
+        pass  # best-effort cleanup
+
+    return PickerImportResponse(
+        document_id=document.id,
+        imported_count=imported,
     )

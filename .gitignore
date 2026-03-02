@@ -10,12 +10,13 @@ venv/
 node_modules/
 frontend/dist/
 
-# Data
-data/uploads/
-data/models/
+# Data (runtime-generated)
+data/
+backend/data/
 *.pt
 *.bin
 *.safetensors
+*.db
 
 # Environment
 .env

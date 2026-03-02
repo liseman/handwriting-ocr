@@ -68,7 +68,7 @@ export async function uploadDocuments(files) {
 }
 
 export async function captureCamera(base64) {
-  const { data } = await api.post('/documents/capture', { image: base64 });
+  const { data } = await api.post('/documents/camera', { image: base64 });
   return data;
 }
 
@@ -82,20 +82,55 @@ export async function deleteDocument(id) {
   return data;
 }
 
+export async function rotatePage(pageId, rotation) {
+  const { data } = await api.post(`/documents/pages/${pageId}/rotate`, { rotation });
+  return data;
+}
+
 // ---- OCR ----
 
 export async function processPage(pageId) {
-  const { data } = await api.post(`/ocr/process/page/${pageId}`);
+  const { data } = await api.post(`/ocr/process/${pageId}`);
   return data;
 }
 
 export async function processDocument(docId) {
-  const { data } = await api.post(`/ocr/process/document/${docId}`);
+  const { data } = await api.post(`/ocr/process-document/${docId}`);
   return data;
 }
 
 export async function getResults(pageId) {
   const { data } = await api.get(`/ocr/results/${pageId}`);
+  return data;
+}
+
+export async function processBbox(pageId, bbox) {
+  const { data } = await api.post(`/ocr/process-bbox/${pageId}`, {
+    bbox_x: bbox.x,
+    bbox_y: bbox.y,
+    bbox_w: bbox.w,
+    bbox_h: bbox.h,
+  });
+  return data;
+}
+
+export async function setPageCrop(pageId, bbox) {
+  const { data } = await api.post(`/documents/pages/${pageId}/crop`, {
+    crop_x: bbox.x,
+    crop_y: bbox.y,
+    crop_w: bbox.w,
+    crop_h: bbox.h,
+  });
+  return data;
+}
+
+export async function clearPageCrop(pageId) {
+  const { data } = await api.post(`/documents/pages/${pageId}/crop/clear`);
+  return data;
+}
+
+export async function autoCropPage(pageId) {
+  const { data } = await api.post(`/documents/pages/${pageId}/crop/auto`);
   return data;
 }
 
@@ -114,11 +149,23 @@ export async function getPlayItems() {
   return data;
 }
 
-export async function submitPlayCorrection(ocrResultId, text) {
-  const { data } = await api.post('/corrections/play', {
+export async function submitPlayCorrection(ocrResultId, text, correctedBbox = null) {
+  const body = {
     ocr_result_id: ocrResultId,
     corrected_text: text,
-  });
+  };
+  if (correctedBbox) {
+    body.corrected_bbox_x = correctedBbox.x;
+    body.corrected_bbox_y = correctedBbox.y;
+    body.corrected_bbox_w = correctedBbox.w;
+    body.corrected_bbox_h = correctedBbox.h;
+  }
+  const { data } = await api.post('/corrections/play/submit', body);
+  return data;
+}
+
+export async function getProcessingStatus() {
+  const { data } = await api.get('/ocr/processing-status');
   return data;
 }
 
@@ -129,22 +176,22 @@ export async function search(query) {
   return data;
 }
 
-// ---- Google Photos ----
+// ---- Google Photos Picker ----
 
-export async function getAlbums() {
-  const { data } = await api.get('/photos/albums');
+export async function createPickerSession() {
+  const { data } = await api.post('/photos/picker/session');
   return data;
 }
 
-export async function getAlbumItems(albumId) {
-  const { data } = await api.get(`/photos/albums/${albumId}/items`);
+export async function pollPickerSession(sessionId) {
+  const { data } = await api.get(`/photos/picker/session/${sessionId}`);
   return data;
 }
 
-export async function importPhotos(photoIds, albumId) {
-  const { data } = await api.post('/photos/import', {
-    photo_ids: photoIds,
-    album_id: albumId,
+export async function importFromPicker(sessionId, documentName) {
+  const { data } = await api.post('/photos/picker/import', {
+    session_id: sessionId,
+    document_name: documentName || 'Google Photos Import',
   });
   return data;
 }
@@ -173,6 +220,20 @@ export async function exportModel() {
   link.remove();
   window.URL.revokeObjectURL(url);
   return true;
+}
+
+// ---- Calibration ----
+
+export async function submitCalibration(pageId, bbox, groundTruth) {
+  const { data } = await api.post('/model/calibrate', {
+    page_id: pageId,
+    bbox_x: bbox.x,
+    bbox_y: bbox.y,
+    bbox_w: bbox.w,
+    bbox_h: bbox.h,
+    ground_truth: groundTruth,
+  });
+  return data;
 }
 
 export default api;

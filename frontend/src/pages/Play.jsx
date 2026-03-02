@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getPlayItems, submitPlayCorrection } from '../api';
+import { getPlayItems, submitPlayCorrection, rotatePage, processPage } from '../api';
 import { useToast } from '../hooks/useToast';
 import ConfidenceBadge from '../components/ConfidenceBadge';
+import BboxHighlightViewer from '../components/BboxHighlightViewer';
 
 function SpeechInput({ onResult, listening, onToggle }) {
   const recognitionRef = useRef(null);
@@ -75,6 +76,8 @@ export default function Play() {
   const [isCorrectMode, setIsCorrectMode] = useState(false);
   const [listening, setListening] = useState(false);
   const [transitioning, setTransitioning] = useState(false);
+  const [drawMode, setDrawMode] = useState(false);
+  const [correctedBbox, setCorrectedBbox] = useState(null);
   const inputRef = useRef(null);
 
   const { data: playItems, isLoading } = useQuery({
@@ -83,24 +86,47 @@ export default function Play() {
   });
 
   const items = Array.isArray(playItems) ? playItems : playItems?.items || [];
-  const totalCount = playItems?.total_count ?? items.length;
+  const remaining = playItems?.remaining ?? 0;
+  const totalCount = items.length + remaining;
   const currentItem = items[currentIndex];
 
   // Pre-fill correction text when viewing a new item
   useEffect(() => {
     if (currentItem) {
-      setCorrectionText(currentItem.text || '');
+      setCorrectionText(currentItem.recognized_text || '');
       setIsCorrectMode(false);
+      setDrawMode(false);
+      setCorrectedBbox(null);
     }
   }, [currentItem]);
 
   const submitMutation = useMutation({
-    mutationFn: ({ ocrResultId, text }) => submitPlayCorrection(ocrResultId, text),
-    onSuccess: () => {
+    mutationFn: ({ ocrResultId, text, bbox }) => submitPlayCorrection(ocrResultId, text, bbox),
+    onSuccess: (_data, variables) => {
+      toast.success(variables._toastMsg || 'Submitted');
       advanceToNext();
     },
     onError: () => {
       toast.error('Failed to submit. Please try again.');
+    },
+  });
+
+  const rotateMutation = useMutation({
+    mutationFn: async () => {
+      if (!currentItem) return;
+      await rotatePage(currentItem.page_id, 90);
+      // Trigger OCR reprocessing so new results appear in Play
+      await processPage(currentItem.page_id);
+    },
+    onSuccess: () => {
+      toast.success('Page rotated — reprocessing OCR');
+      // Delay refetch to give OCR time to run
+      setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ['playItems'] });
+      }, 5000);
+    },
+    onError: () => {
+      toast.error('Failed to rotate page.');
     },
   });
 
@@ -110,12 +136,13 @@ export default function Play() {
       if (currentIndex < items.length - 1) {
         setCurrentIndex((prev) => prev + 1);
       } else {
-        // Reload items to check for more
         queryClient.invalidateQueries({ queryKey: ['playItems'] });
         setCurrentIndex(0);
       }
       setCorrectionText('');
       setIsCorrectMode(false);
+      setDrawMode(false);
+      setCorrectedBbox(null);
       setTransitioning(false);
     }, 200);
   }, [currentIndex, items.length, queryClient]);
@@ -123,19 +150,21 @@ export default function Play() {
   const handleConfirmCorrect = () => {
     if (!currentItem) return;
     submitMutation.mutate({
-      ocrResultId: currentItem.id || currentItem.ocr_result_id,
-      text: currentItem.text,
+      ocrResultId: currentItem.ocr_result_id,
+      text: currentItem.recognized_text,
+      bbox: correctedBbox,
+      _toastMsg: 'Marked as correct',
     });
-    toast.success('Marked as correct');
   };
 
   const handleSubmitCorrection = () => {
     if (!currentItem || !correctionText.trim()) return;
     submitMutation.mutate({
-      ocrResultId: currentItem.id || currentItem.ocr_result_id,
+      ocrResultId: currentItem.ocr_result_id,
       text: correctionText.trim(),
+      bbox: correctedBbox,
+      _toastMsg: 'Correction submitted',
     });
-    toast.success('Correction submitted');
   };
 
   const handleSkip = () => {
@@ -146,6 +175,11 @@ export default function Play() {
     setCorrectionText(transcript);
     setIsCorrectMode(true);
     setListening(false);
+  }, []);
+
+  const handleDrawBbox = useCallback((bbox) => {
+    setCorrectedBbox(bbox);
+    setDrawMode(false);
   }, []);
 
   // Focus input when entering correct mode
@@ -195,9 +229,12 @@ export default function Play() {
     );
   }
 
-  // Build the image source for the cropped handwriting region
-  const imageUrl = currentItem.image_url || currentItem.page_image_url;
-  const bbox = currentItem.bounding_box || currentItem.bbox;
+  const activeBbox = correctedBbox || (currentItem ? {
+    x: currentItem.bbox_x,
+    y: currentItem.bbox_y,
+    w: currentItem.bbox_w,
+    h: currentItem.bbox_h,
+  } : null);
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-6">
@@ -223,30 +260,69 @@ export default function Play() {
       >
         {/* Card */}
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
-          {/* Handwriting image */}
-          <div className="bg-gray-50 border-b border-gray-200 p-4 flex items-center justify-center min-h-[160px]">
-            {imageUrl ? (
-              <img
-                src={imageUrl}
-                alt="Handwritten text"
-                className="max-w-full max-h-48 object-contain rounded"
-                loading="lazy"
-                style={
-                  bbox
-                    ? {
-                        // If we have bbox info, we could use object-position to show the right area.
-                        // For a real cropped image from the server, just show it.
-                      }
-                    : undefined
-                }
+          {/* Handwriting image with bbox highlight */}
+          <div className="bg-gray-50 border-b border-gray-200 p-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs text-gray-400 font-medium uppercase tracking-wide">
+                {currentItem.document_name}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => rotateMutation.mutate()}
+                  disabled={rotateMutation.isPending}
+                  className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-200 transition-colors disabled:opacity-30"
+                  title="Rotate page 90°"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => {
+                    setDrawMode(!drawMode);
+                    if (drawMode) setCorrectedBbox(null);
+                  }}
+                  className={`p-1.5 rounded-lg transition-colors ${
+                    drawMode
+                      ? 'bg-blue-100 text-blue-600'
+                      : 'text-gray-400 hover:text-gray-600 hover:bg-gray-200'
+                  }`}
+                  title={drawMode ? 'Cancel drawing' : 'Adjust region'}
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h4a1 1 0 010 2H6v3a1 1 0 01-2 0V5zm16 0a1 1 0 00-1-1h-4a1 1 0 000 2h3v3a1 1 0 002 0V5zM4 19a1 1 0 001 1h4a1 1 0 000-2H6v-3a1 1 0 00-2 0v4zm16 0a1 1 0 01-1 1h-4a1 1 0 010-2h3v-3a1 1 0 012 0v4z" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            {currentItem.image_url ? (
+              <BboxHighlightViewer
+                imageSrc={currentItem.image_url}
+                bbox={activeBbox}
+                drawMode={drawMode}
+                onDrawBbox={handleDrawBbox}
               />
             ) : (
-              <div className="text-center text-gray-400">
+              <div className="text-center text-gray-400 py-8">
                 <svg className="w-12 h-12 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                 </svg>
                 <p className="text-sm">Image not available</p>
               </div>
+            )}
+            {correctedBbox && (
+              <div className="mt-2 flex items-center gap-2">
+                <span className="text-xs text-blue-600 font-medium">Custom region set</span>
+                <button
+                  onClick={() => setCorrectedBbox(null)}
+                  className="text-xs text-gray-400 hover:text-gray-600"
+                >
+                  Reset
+                </button>
+              </div>
+            )}
+            {drawMode && (
+              <p className="mt-2 text-xs text-blue-500">Click and drag on the image to draw a new bounding box</p>
             )}
           </div>
 
@@ -278,7 +354,7 @@ export default function Play() {
             )}
 
             <p className="text-lg text-gray-900 font-mono bg-gray-50 rounded-lg px-4 py-3 border border-gray-200">
-              {currentItem.text || <span className="italic text-gray-400">No text recognized</span>}
+              {currentItem.recognized_text || <span className="italic text-gray-400">No text recognized</span>}
             </p>
 
             {/* Correction input */}

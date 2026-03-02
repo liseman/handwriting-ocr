@@ -13,7 +13,7 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models import Correction, Document, OcrResult, Page, User, UserModel
-from app.schemas import ModelStatusOut, TrainRequest, TrainResponse
+from app.schemas import CalibrateRequest, ModelStatusOut, TrainRequest, TrainResponse
 
 router = APIRouter(prefix="/model", tags=["model"])
 
@@ -190,6 +190,118 @@ async def train_model(
 
     return TrainResponse(
         message=f"Training v{new_version} started in background",
+        version=new_version,
+        num_corrections=total_corrections,
+    )
+
+
+@router.post("/calibrate", response_model=TrainResponse)
+async def calibrate(
+    body: CalibrateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TrainResponse:
+    """Calibrate: OCR a user-drawn region with known ground truth, create a
+    correction, and trigger fine-tuning.
+
+    This bootstraps training when the user has no corrections yet.
+    """
+    import logging
+
+    from app.ocr import get_engine, get_gemini_engine, has_gemini, preprocess_image
+    from app.routes.search import index_ocr_result
+
+    logger = logging.getLogger(__name__)
+
+    # Verify ownership of the page.
+    page_stmt = (
+        select(Page)
+        .join(Document, Page.document_id == Document.id)
+        .where(Page.id == body.page_id, Document.user_id == current_user.id)
+    )
+    page_result = await db.execute(page_stmt)
+    page = page_result.scalar_one_or_none()
+    if page is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
+
+    doc_stmt = select(Document).where(Document.id == page.document_id)
+    doc_result = await db.execute(doc_stmt)
+    document = doc_result.scalar_one_or_none()
+
+    # Load image and crop to bbox.
+    image = preprocess_image(page.image_path, rotation=page.rotation)
+    bbox_img = image.crop((
+        body.bbox_x, body.bbox_y,
+        body.bbox_x + body.bbox_w, body.bbox_y + body.bbox_h,
+    ))
+
+    # Check user model.
+    user_model = await _get_latest_model(current_user.id, db)
+
+    if has_gemini():
+        gemini = get_gemini_engine()
+        text, confidence = gemini.process_single(bbox_img)
+        model_version = "gemini-flash"
+    else:
+        model_version = f"user-v{user_model.version}" if user_model else "base"
+        engine = get_engine()
+        if user_model and user_model.lora_path:
+            engine.load_user_model(current_user.id, user_model.lora_path)
+        else:
+            engine.unload_user_model()
+        text, confidence = engine.process_single(bbox_img)
+
+    # Create OCR result.
+    ocr_row = OcrResult(
+        page_id=page.id,
+        bbox_x=body.bbox_x,
+        bbox_y=body.bbox_y,
+        bbox_w=body.bbox_w,
+        bbox_h=body.bbox_h,
+        text=text or "",
+        confidence=confidence,
+        model_version=model_version,
+    )
+    db.add(ocr_row)
+    await db.flush()
+
+    # Index in Whoosh.
+    if document and text:
+        try:
+            index_ocr_result(
+                ocr_result_id=ocr_row.id,
+                user_id=current_user.id,
+                page_id=page.id,
+                document_id=document.id,
+                text=text,
+            )
+        except Exception:
+            logger.warning("Failed to index calibration OCR result %d", ocr_row.id, exc_info=True)
+
+    # Create correction with the known ground truth.
+    correction = Correction(
+        ocr_result_id=ocr_row.id,
+        original_text=text or "",
+        corrected_text=body.ground_truth,
+    )
+    db.add(correction)
+    await db.commit()
+
+    # Trigger fine-tuning.
+    total_corrections = await _count_user_corrections(current_user.id, db)
+    new_version = (user_model.version + 1) if user_model else 1
+
+    background_tasks.add_task(
+        _run_finetuning,
+        current_user.id,
+        new_version,
+        3,   # epochs
+        1e-4,  # learning_rate
+    )
+
+    return TrainResponse(
+        message=f"Calibration complete. Training v{new_version} started.",
         version=new_version,
         num_corrections=total_corrections,
     )

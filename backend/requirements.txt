@@ -20,8 +20,11 @@ transformers==4.47.1
 torch==2.5.1
 torchvision==0.20.1
 peft==0.14.0
+datasets>=2.14.0
 Pillow==11.1.0
+pillow-heif==0.21.0
 accelerate==1.2.1
+google-genai>=1.0.0
 
 # Google Photos
 google-api-python-client==2.159.0

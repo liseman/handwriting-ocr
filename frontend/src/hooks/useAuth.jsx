@@ -4,19 +4,20 @@ import { getMe, logout as apiLogout } from '../api';
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-
-  // Check for token in URL params (after OAuth callback)
-  useEffect(() => {
+  // Extract token from URL SYNCHRONOUSLY before any effects or Navigate
+  // components can change the URL (child effects run before parent effects).
+  const [initialToken] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token');
     if (token) {
       localStorage.setItem('token', token);
-      // Clean the URL
       window.history.replaceState({}, '', window.location.pathname);
     }
-  }, []);
+    return token;
+  });
+
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   // Check auth status on mount
   useEffect(() => {

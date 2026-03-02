@@ -62,6 +62,9 @@ async def create_correction(
         corrected_text=body.corrected_text,
     )
     db.add(correction)
+
+    # Update the displayed text so the UI reflects the correction.
+    ocr_result.text = body.corrected_text
     await db.flush()
     return correction
 
@@ -121,7 +124,7 @@ async def play_batch(
 
     # Main query: uncorrected OCR results for this user, ordered by priority.
     stmt = (
-        select(OcrResult, Page.image_path, Document.name.label("document_name"))
+        select(OcrResult, Page.image_path, Page.rotation, Document.name.label("document_name"))
         .join(Page, OcrResult.page_id == Page.id)
         .join(Document, Page.document_id == Document.id)
         .outerjoin(doc_correction_count_sq, Document.id == doc_correction_count_sq.c.doc_id)
@@ -151,8 +154,9 @@ async def play_batch(
             recognized_text=ocr.text,
             confidence=ocr.confidence,
             document_name=doc_name,
+            page_rotation=page_rotation,
         )
-        for ocr, image_path, doc_name in rows
+        for ocr, image_path, page_rotation, doc_name in rows
     ]
 
     # Count remaining uncorrected items.
@@ -187,7 +191,14 @@ async def play_submit(
         ocr_result_id=ocr_result.id,
         original_text=ocr_result.text,
         corrected_text=body.corrected_text,
+        corrected_bbox_x=body.corrected_bbox_x,
+        corrected_bbox_y=body.corrected_bbox_y,
+        corrected_bbox_w=body.corrected_bbox_w,
+        corrected_bbox_h=body.corrected_bbox_h,
     )
     db.add(correction)
+
+    # Update the displayed text so the UI reflects the correction.
+    ocr_result.text = body.corrected_text
     await db.flush()
     return correction

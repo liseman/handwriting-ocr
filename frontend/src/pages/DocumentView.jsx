@@ -1,7 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getDocument, processDocument, processPage, getResults, submitCorrection } from '../api';
+import {
+  getDocument, processDocument, processPage, getResults,
+  submitCorrection, rotatePage, processBbox, setPageCrop, clearPageCrop,
+  autoCropPage, getProcessingStatus,
+} from '../api';
 import { useToast } from '../hooks/useToast';
 import PageViewer from '../components/PageViewer';
 import OcrResultList from '../components/OcrResultList';
@@ -13,6 +17,8 @@ export default function DocumentView() {
   const queryClient = useQueryClient();
   const [selectedPageIndex, setSelectedPageIndex] = useState(0);
   const [selectedResultId, setSelectedResultId] = useState(null);
+  const [drawMode, setDrawMode] = useState(false);
+  const [cropMode, setCropMode] = useState(false);
 
   const { data: doc, isLoading: docLoading } = useQuery({
     queryKey: ['document', id],
@@ -24,22 +30,65 @@ export default function DocumentView() {
   const currentPage = pages[selectedPageIndex];
   const currentPageId = currentPage?.id;
 
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  // Poll processing status for this document's pages.
+  const { data: processingStatus } = useQuery({
+    queryKey: ['processingStatus'],
+    queryFn: getProcessingStatus,
+    refetchInterval: isProcessing ? 2000 : false,
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (!isProcessing || !processingStatus?.pages) return;
+    const docPages = pages.map(p => p.id);
+    const stillProcessing = processingStatus.pages.some(
+      p => docPages.includes(p.page_id) && p.status === 'processing'
+    );
+    const anyDone = processingStatus.pages.some(
+      p => docPages.includes(p.page_id) && (p.status === 'done' || p.status === 'error')
+    );
+    if (anyDone) {
+      queryClient.invalidateQueries({ queryKey: ['document', id] });
+      queryClient.invalidateQueries({ queryKey: ['ocrResults', currentPageId] });
+      const donePage = processingStatus.pages.find(
+        p => docPages.includes(p.page_id) && p.status === 'done'
+      );
+      if (donePage) {
+        toast.success('OCR processing complete!');
+      }
+      const errorPage = processingStatus.pages.find(
+        p => docPages.includes(p.page_id) && p.status === 'error'
+      );
+      if (errorPage) {
+        toast.error('OCR processing failed for a page.');
+      }
+    }
+    if (!stillProcessing && !anyDone) {
+      setIsProcessing(false);
+    }
+  }, [processingStatus, isProcessing, pages, currentPageId, id, queryClient, toast]);
+
   const { data: ocrResults, isLoading: ocrLoading } = useQuery({
     queryKey: ['ocrResults', currentPageId],
     queryFn: () => getResults(currentPageId),
     enabled: !!currentPageId,
+    refetchInterval: isProcessing ? 3000 : false,
   });
 
   const results = Array.isArray(ocrResults) ? ocrResults : ocrResults?.results || [];
 
-  // Reset selected result when page changes
   useEffect(() => {
     setSelectedResultId(null);
+    setDrawMode(false);
+    setCropMode(false);
   }, [selectedPageIndex]);
 
   const processDocMutation = useMutation({
     mutationFn: () => processDocument(id),
     onSuccess: () => {
+      setIsProcessing(true);
       queryClient.invalidateQueries({ queryKey: ['document', id] });
       queryClient.invalidateQueries({ queryKey: ['ocrResults'] });
       toast.success('OCR processing started for all pages');
@@ -52,6 +101,7 @@ export default function DocumentView() {
   const processPageMutation = useMutation({
     mutationFn: () => processPage(currentPageId),
     onSuccess: () => {
+      setIsProcessing(true);
       queryClient.invalidateQueries({ queryKey: ['ocrResults', currentPageId] });
       toast.success('Page processing started');
     },
@@ -71,6 +121,73 @@ export default function DocumentView() {
     },
   });
 
+  const rotateMutation = useMutation({
+    mutationFn: () => rotatePage(currentPageId, 90),
+    onSuccess: () => {
+      // image_path changes on rotation (new filename), so URL updates naturally
+      queryClient.invalidateQueries({ queryKey: ['document', id] });
+      queryClient.invalidateQueries({ queryKey: ['ocrResults', currentPageId] });
+      toast.success('Page rotated');
+    },
+    onError: () => {
+      toast.error('Failed to rotate page.');
+    },
+  });
+
+  const processBboxMutation = useMutation({
+    mutationFn: (bbox) => processBbox(currentPageId, bbox),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ocrResults', currentPageId] });
+      toast.success('Box OCR result added');
+      setDrawMode(false);
+    },
+    onError: () => {
+      toast.error('Failed to process bounding box.');
+    },
+  });
+
+  const setCropMutation = useMutation({
+    mutationFn: (bbox) => setPageCrop(currentPageId, bbox),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['document', id] });
+      toast.success('Crop region set');
+      setCropMode(false);
+    },
+    onError: () => {
+      toast.error('Failed to set crop region.');
+    },
+  });
+
+  const clearCropMutation = useMutation({
+    mutationFn: () => clearPageCrop(currentPageId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['document', id] });
+      toast.success('Crop cleared');
+    },
+    onError: () => {
+      toast.error('Failed to clear crop.');
+    },
+  });
+
+  const autoCropMutation = useMutation({
+    mutationFn: () => autoCropPage(currentPageId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['document', id] });
+      toast.success('Auto-crop applied');
+    },
+    onError: () => {
+      toast.error('Failed to auto-crop.');
+    },
+  });
+
+  const handleDrawBbox = useCallback((bbox) => {
+    if (cropMode) {
+      setCropMutation.mutate(bbox);
+    } else if (drawMode) {
+      processBboxMutation.mutate(bbox);
+    }
+  }, [cropMode, drawMode, setCropMutation, processBboxMutation]);
+
   const handleCorrect = (resultId, text) => {
     correctionMutation.mutate({ resultId, text });
   };
@@ -82,6 +199,16 @@ export default function DocumentView() {
   const goToNextPage = () => {
     if (selectedPageIndex < pages.length - 1) setSelectedPageIndex(selectedPageIndex + 1);
   };
+
+  const activeDrawMode = drawMode || cropMode;
+
+  const hasCrop = currentPage?.crop_x != null;
+  const cropData = hasCrop ? {
+    crop_x: currentPage.crop_x,
+    crop_y: currentPage.crop_y,
+    crop_w: currentPage.crop_w,
+    crop_h: currentPage.crop_h,
+  } : null;
 
   if (docLoading) {
     return (
@@ -156,14 +283,14 @@ export default function DocumentView() {
             disabled={processDocMutation.isPending}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-primary-600 text-white text-sm font-medium rounded-lg hover:bg-primary-700 disabled:opacity-50 transition-colors"
           >
-            {processDocMutation.isPending ? (
+            {(processDocMutation.isPending || isProcessing) ? (
               <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
             ) : (
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
               </svg>
             )}
-            Process OCR
+            {isProcessing ? 'Processing...' : 'Process OCR'}
           </button>
         </div>
       </div>
@@ -183,8 +310,8 @@ export default function DocumentView() {
                       : 'border-gray-200 hover:border-gray-300'
                   }`}
                 >
-                  {page.thumbnail_url ? (
-                    <img src={page.thumbnail_url} alt={`Page ${index + 1}`} className="w-full h-full object-cover" loading="lazy" />
+                  {page.image_url ? (
+                    <img src={page.image_url} alt={`Page ${index + 1}`} className="w-full h-full object-cover" loading="lazy" />
                   ) : (
                     <div className="w-full h-full bg-gray-100 flex items-center justify-center text-xs text-gray-400">
                       {index + 1}
@@ -211,9 +338,69 @@ export default function DocumentView() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
                   </svg>
                 </button>
-                <span className="text-sm text-gray-500">
-                  Page {selectedPageIndex + 1} of {pages.length}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">
+                    Page {selectedPageIndex + 1} of {pages.length}
+                  </span>
+                  <button
+                    onClick={() => rotateMutation.mutate()}
+                    disabled={rotateMutation.isPending}
+                    className="p-1 text-gray-500 hover:text-gray-700 disabled:opacity-30 transition-colors"
+                    title="Rotate 90"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  </button>
+                  {/* Draw Box button */}
+                  <button
+                    onClick={() => { setDrawMode(!drawMode); setCropMode(false); }}
+                    className={`p-1 rounded transition-colors ${
+                      drawMode ? 'bg-blue-100 text-blue-600' : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                    title={drawMode ? 'Cancel draw box' : 'Draw box for OCR'}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h4a1 1 0 010 2H6v3a1 1 0 01-2 0V5zm16 0a1 1 0 00-1-1h-4a1 1 0 000 2h3v3a1 1 0 002 0V5zM4 19a1 1 0 001 1h4a1 1 0 000-2H6v-3a1 1 0 00-2 0v4zm16 0a1 1 0 01-1 1h-4a1 1 0 010-2h3v-3a1 1 0 012 0v4z" />
+                    </svg>
+                  </button>
+                  {/* Crop button */}
+                  <button
+                    onClick={() => { setCropMode(!cropMode); setDrawMode(false); }}
+                    className={`p-1 rounded transition-colors ${
+                      cropMode ? 'bg-green-100 text-green-600' : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                    title={cropMode ? 'Cancel crop' : 'Set crop region'}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7V5a2 2 0 012-2h2M17 3h2a2 2 0 012 2v2M21 17v2a2 2 0 01-2 2h-2M7 21H5a2 2 0 01-2-2v-2" />
+                    </svg>
+                  </button>
+                  {/* Auto crop */}
+                  <button
+                    onClick={() => autoCropMutation.mutate()}
+                    disabled={autoCropMutation.isPending}
+                    className="p-1 text-gray-500 hover:text-gray-700 disabled:opacity-30 transition-colors"
+                    title="Auto-detect crop"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                  </button>
+                  {/* Clear crop */}
+                  {hasCrop && (
+                    <button
+                      onClick={() => clearCropMutation.mutate()}
+                      disabled={clearCropMutation.isPending}
+                      className="p-1 text-red-500 hover:text-red-700 transition-colors"
+                      title="Clear crop"
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
                 <button
                   onClick={goToNextPage}
                   disabled={selectedPageIndex === pages.length - 1}
@@ -225,6 +412,15 @@ export default function DocumentView() {
                 </button>
               </div>
 
+              {/* Active mode indicator */}
+              {activeDrawMode && (
+                <div className={`px-4 py-1.5 text-xs font-medium ${
+                  cropMode ? 'bg-green-50 text-green-700' : 'bg-blue-50 text-blue-700'
+                }`}>
+                  {cropMode ? 'Draw a rectangle to set the crop region' : 'Draw a rectangle to OCR that region'}
+                </div>
+              )}
+
               {/* Image with overlays */}
               <div className="p-2">
                 <PageViewer
@@ -232,6 +428,9 @@ export default function DocumentView() {
                   ocrResults={results}
                   selectedResultId={selectedResultId}
                   onSelectResult={setSelectedResultId}
+                  crop={cropData}
+                  drawMode={activeDrawMode}
+                  onDrawBbox={handleDrawBbox}
                 />
               </div>
             </div>

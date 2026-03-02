@@ -1,19 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 
-export default function PageViewer({
-  imageSrc,
-  ocrResults = [],
-  selectedResultId,
-  onSelectResult,
-  crop = null,
-  drawMode = false,
-  onDrawBbox,
-}) {
+export default function BboxHighlightViewer({ imageSrc, bbox, drawMode = false, onDrawBbox }) {
   const containerRef = useRef(null);
   const imgRef = useRef(null);
-  const [imgDimensions, setImgDimensions] = useState({ width: 0, height: 0, naturalWidth: 0, naturalHeight: 0 });
+  const [imgDims, setImgDims] = useState({ width: 0, height: 0, naturalWidth: 0, naturalHeight: 0 });
   const [loaded, setLoaded] = useState(false);
-  const [drawing, setDrawing] = useState(null);
+  const [drawing, setDrawing] = useState(null); // { startX, startY, currentX, currentY } in natural coords
 
   // Reset loaded state when image source changes (e.g., after rotation)
   useEffect(() => {
@@ -23,7 +15,7 @@ export default function PageViewer({
   const updateDimensions = useCallback(() => {
     if (!imgRef.current) return;
     const img = imgRef.current;
-    setImgDimensions({
+    setImgDims({
       width: img.clientWidth,
       height: img.clientHeight,
       naturalWidth: img.naturalWidth,
@@ -43,21 +35,21 @@ export default function PageViewer({
     updateDimensions();
   };
 
-  const scaleX = imgDimensions.naturalWidth > 0 ? imgDimensions.width / imgDimensions.naturalWidth : 1;
-  const scaleY = imgDimensions.naturalHeight > 0 ? imgDimensions.height / imgDimensions.naturalHeight : 1;
+  const scaleX = imgDims.naturalWidth > 0 ? imgDims.width / imgDims.naturalWidth : 1;
+  const scaleY = imgDims.naturalHeight > 0 ? imgDims.height / imgDims.naturalHeight : 1;
 
-  // ── Draw mode mouse handlers ──
   const toNatural = useCallback((clientX, clientY) => {
     if (!imgRef.current) return { x: 0, y: 0 };
     const rect = imgRef.current.getBoundingClientRect();
     const x = Math.round((clientX - rect.left) / scaleX);
     const y = Math.round((clientY - rect.top) / scaleY);
     return {
-      x: Math.max(0, Math.min(x, imgDimensions.naturalWidth)),
-      y: Math.max(0, Math.min(y, imgDimensions.naturalHeight)),
+      x: Math.max(0, Math.min(x, imgDims.naturalWidth)),
+      y: Math.max(0, Math.min(y, imgDims.naturalHeight)),
     };
-  }, [scaleX, scaleY, imgDimensions.naturalWidth, imgDimensions.naturalHeight]);
+  }, [scaleX, scaleY, imgDims.naturalWidth, imgDims.naturalHeight]);
 
+  // ── Mouse handlers ──
   const handleMouseDown = useCallback((e) => {
     if (!drawMode) return;
     e.preventDefault();
@@ -101,10 +93,10 @@ export default function PageViewer({
   }, [drawing, toNatural]);
 
   const handleTouchEnd = useCallback(() => {
-    handleMouseUp();
+    handleMouseUp(); // reuse same finalize logic
   }, [handleMouseUp]);
 
-  // Draw rect in display coords
+  // Compute draw rect in display coords
   const drawRect = drawing ? {
     left: Math.min(drawing.startX, drawing.currentX) * scaleX,
     top: Math.min(drawing.startY, drawing.currentY) * scaleY,
@@ -112,30 +104,34 @@ export default function PageViewer({
     height: Math.abs(drawing.currentY - drawing.startY) * scaleY,
   } : null;
 
-  // Crop overlay in display coords
-  const cropDisplay = crop ? {
-    left: crop.crop_x * scaleX,
-    top: crop.crop_y * scaleY,
-    width: crop.crop_w * scaleX,
-    height: crop.crop_h * scaleY,
+  // Bbox in display coords
+  const bboxDisplay = bbox ? {
+    left: bbox.x * scaleX,
+    top: bbox.y * scaleY,
+    width: bbox.w * scaleX,
+    height: bbox.h * scaleY,
   } : null;
 
+  // Zoom scale for the cropped view
+  const zoomScale = bbox && bbox.w > 0 ? Math.min(400, bbox.w * 3) / bbox.w : 1;
+
   return (
-    <div
-      ref={containerRef}
-      className={`relative inline-block w-full overflow-hidden ${drawMode ? 'cursor-crosshair' : ''}`}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={handleTouchEnd}
-    >
-      {!loaded && (
-        <div className="skeleton w-full" style={{ paddingBottom: '141.4%' }} />
-      )}
-      <div className="relative">
+    <div className="space-y-3">
+      {/* Full page with highlight */}
+      <div
+        ref={containerRef}
+        className={`relative inline-block w-full ${drawMode ? 'cursor-crosshair' : ''}`}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+      >
+        {!loaded && (
+          <div className="skeleton w-full" style={{ paddingBottom: '141.4%' }} />
+        )}
         <img
           ref={imgRef}
           src={imageSrc}
@@ -145,59 +141,30 @@ export default function PageViewer({
           className={`w-full h-auto block transition-opacity duration-300 ${loaded ? 'opacity-100' : 'opacity-0'}`}
           draggable={false}
         />
-
-        {/* Persistent crop overlay */}
-        {loaded && cropDisplay && !drawMode && (
+        {/* Dark overlay outside bbox */}
+        {loaded && bboxDisplay && !drawMode && (
           <>
-            <div className="absolute inset-x-0 top-0 bg-black/30" style={{ height: `${cropDisplay.top}px` }} />
-            <div className="absolute inset-x-0 bg-black/30" style={{ top: `${cropDisplay.top + cropDisplay.height}px`, bottom: 0 }} />
-            <div className="absolute bg-black/30" style={{ top: `${cropDisplay.top}px`, left: 0, width: `${cropDisplay.left}px`, height: `${cropDisplay.height}px` }} />
-            <div className="absolute bg-black/30" style={{ top: `${cropDisplay.top}px`, left: `${cropDisplay.left + cropDisplay.width}px`, right: 0, height: `${cropDisplay.height}px` }} />
+            {/* Top */}
+            <div className="absolute inset-x-0 top-0 bg-black/40" style={{ height: `${bboxDisplay.top}px` }} />
+            {/* Bottom */}
+            <div className="absolute inset-x-0 bg-black/40" style={{ top: `${bboxDisplay.top + bboxDisplay.height}px`, bottom: 0 }} />
+            {/* Left */}
+            <div className="absolute bg-black/40" style={{ top: `${bboxDisplay.top}px`, left: 0, width: `${bboxDisplay.left}px`, height: `${bboxDisplay.height}px` }} />
+            {/* Right */}
+            <div className="absolute bg-black/40" style={{ top: `${bboxDisplay.top}px`, left: `${bboxDisplay.left + bboxDisplay.width}px`, right: 0, height: `${bboxDisplay.height}px` }} />
+            {/* Yellow border */}
             <div
-              className="absolute border-2 border-dashed border-green-500"
+              className="absolute border-2 border-yellow-400 shadow-lg"
               style={{
-                left: `${cropDisplay.left}px`,
-                top: `${cropDisplay.top}px`,
-                width: `${cropDisplay.width}px`,
-                height: `${cropDisplay.height}px`,
+                left: `${bboxDisplay.left}px`,
+                top: `${bboxDisplay.top}px`,
+                width: `${bboxDisplay.width}px`,
+                height: `${bboxDisplay.height}px`,
               }}
             />
           </>
         )}
-
-        {/* OCR result bounding boxes */}
-        {loaded && !drawMode &&
-          ocrResults.map((result) => {
-            const x = result.bbox_x;
-            const y = result.bbox_y;
-            const w = result.bbox_w;
-            const h = result.bbox_h;
-
-            if (x == null || y == null || w == null || h == null) return null;
-
-            const isSelected = result.id === selectedResultId;
-
-            return (
-              <div
-                key={result.id}
-                onClick={() => onSelectResult?.(result.id)}
-                className={`absolute border-2 cursor-pointer transition-all duration-200 ${
-                  isSelected
-                    ? 'border-primary-500 bg-primary-500/20 shadow-lg'
-                    : 'border-transparent hover:border-primary-300 hover:bg-primary-300/10'
-                }`}
-                style={{
-                  left: `${x * scaleX}px`,
-                  top: `${y * scaleY}px`,
-                  width: `${w * scaleX}px`,
-                  height: `${h * scaleY}px`,
-                }}
-                title={result.text}
-              />
-            );
-          })}
-
-        {/* Drawing rectangle (dashed blue) */}
+        {/* Drawing rectangle */}
         {loaded && drawRect && (
           <div
             className="absolute border-2 border-dashed border-blue-500 bg-blue-500/10"
@@ -210,6 +177,36 @@ export default function PageViewer({
           />
         )}
       </div>
+
+      {/* Zoomed crop of the bbox region */}
+      {loaded && bbox && imgDims.naturalWidth > 0 && (
+        <div className="bg-white border border-gray-200 rounded-lg p-2 overflow-hidden">
+          <div className="text-xs text-gray-400 mb-1 font-medium uppercase tracking-wide">Zoomed Region</div>
+          <div className="overflow-hidden rounded" style={{ maxHeight: '120px' }}>
+            <div
+              style={{
+                width: `${bbox.w * zoomScale}px`,
+                height: `${bbox.h * zoomScale}px`,
+                overflow: 'hidden',
+                position: 'relative',
+                maxWidth: '100%',
+              }}
+            >
+              <img
+                src={imageSrc}
+                alt="Zoomed region"
+                style={{
+                  position: 'absolute',
+                  width: `${imgDims.naturalWidth * zoomScale}px`,
+                  left: `-${bbox.x * zoomScale}px`,
+                  top: `-${bbox.y * zoomScale}px`,
+                }}
+                draggable={false}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

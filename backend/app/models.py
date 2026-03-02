@@ -15,6 +15,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     picture_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    google_access_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -55,6 +56,14 @@ class Page(Base):
     )
     image_path: Mapped[str] = mapped_column(String(512), nullable=False)
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    rotation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    crop_x: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    crop_y: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    crop_w: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    crop_h: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    processing_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="idle", server_default="idle"
+    )  # idle | processing | done | error
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -98,6 +107,10 @@ class Correction(Base):
     )
     original_text: Mapped[str] = mapped_column(Text, nullable=False)
     corrected_text: Mapped[str] = mapped_column(Text, nullable=False)
+    corrected_bbox_x: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    corrected_bbox_y: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    corrected_bbox_w: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    corrected_bbox_h: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

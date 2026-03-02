@@ -1,194 +1,122 @@
 import { useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { uploadDocuments, captureCamera, getAlbums, getAlbumItems, importPhotos } from '../api';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { uploadDocuments, captureCamera, createPickerSession, pollPickerSession, importFromPicker } from '../api';
 import { useToast } from '../hooks/useToast';
 import CameraCapture from '../components/CameraCapture';
 
-function AlbumBrowser({ onImport }) {
+function GooglePhotosPicker({ onImport }) {
   const toast = useToast();
-  const [selectedAlbumId, setSelectedAlbumId] = useState(null);
-  const [selectedPhotos, setSelectedPhotos] = useState(new Set());
+  const [status, setStatus] = useState('idle'); // idle | picking | polling | importing
+  const [sessionId, setSessionId] = useState(null);
 
-  const { data: albums, isLoading: albumsLoading } = useQuery({
-    queryKey: ['albums'],
-    queryFn: getAlbums,
-  });
+  const startPicker = async () => {
+    // Open window SYNCHRONOUSLY from the click event to avoid popup blocker.
+    // We'll set the URL once we have the picker URI.
+    const pickerWindow = window.open('about:blank', '_blank', 'width=900,height=700');
 
-  const { data: albumItems, isLoading: itemsLoading } = useQuery({
-    queryKey: ['albumItems', selectedAlbumId],
-    queryFn: () => getAlbumItems(selectedAlbumId),
-    enabled: !!selectedAlbumId,
-  });
+    try {
+      setStatus('picking');
+      const session = await createPickerSession();
+      setSessionId(session.session_id);
 
-  const importMutation = useMutation({
-    mutationFn: ({ photoIds, albumId }) => importPhotos(photoIds, albumId),
-    onSuccess: (data) => {
-      toast.success('Photos imported successfully');
-      onImport(data);
-    },
-    onError: () => {
-      toast.error('Failed to import photos.');
-    },
-  });
-
-  const togglePhoto = (photoId) => {
-    setSelectedPhotos((prev) => {
-      const next = new Set(prev);
-      if (next.has(photoId)) {
-        next.delete(photoId);
+      if (pickerWindow) {
+        pickerWindow.location.href = session.picker_uri;
       } else {
-        next.add(photoId);
+        // Popup was blocked — fall back to same-tab redirect
+        window.location.href = session.picker_uri;
+        return;
       }
-      return next;
-    });
+
+      // Poll until the user finishes selecting.
+      // The user signals "done" by closing the picker window — at that point
+      // mediaItemsSet should be true. We must check ready BEFORE checking
+      // window.closed, because closing IS the expected completion action.
+      setStatus('polling');
+      let windowClosedCount = 0;
+      const poll = async () => {
+        try {
+          const result = await pollPickerSession(session.session_id);
+          if (result.ready) {
+            if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+            setStatus('importing');
+            const imported = await importFromPicker(session.session_id, 'Google Photos Import');
+            toast.success(`Imported ${imported.imported_count} photos`);
+            onImport(imported);
+            setStatus('idle');
+            setSessionId(null);
+            return;
+          }
+        } catch {
+          // API error — keep trying
+        }
+
+        // If the window is closed but not ready, give it a few more polls
+        // (there can be a delay between closing the picker and the session updating)
+        if (pickerWindow?.closed) {
+          windowClosedCount++;
+          if (windowClosedCount > 5) {
+            // User closed without selecting
+            toast.info('Photo picker closed without importing.');
+            setStatus('idle');
+            setSessionId(null);
+            return;
+          }
+        }
+
+        setTimeout(poll, 3000);
+      };
+
+      setTimeout(poll, 2000);
+    } catch (err) {
+      if (pickerWindow) pickerWindow.close();
+      toast.error('Failed to open Google Photos picker. Try signing out and back in.');
+      setStatus('idle');
+    }
   };
 
-  const importSelected = () => {
-    if (selectedPhotos.size === 0) return;
-    importMutation.mutate({
-      photoIds: Array.from(selectedPhotos),
-      albumId: selectedAlbumId,
-    });
-  };
-
-  const importAll = () => {
-    if (!albumItems?.length) return;
-    const allIds = albumItems.map((item) => item.id);
-    importMutation.mutate({
-      photoIds: allIds,
-      albumId: selectedAlbumId,
-    });
-  };
-
-  // Album grid
-  if (!selectedAlbumId) {
-    return (
-      <div>
-        <h3 className="text-sm font-semibold text-gray-700 mb-3">Google Photos Albums</h3>
-        {albumsLoading ? (
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {[1, 2, 3, 4, 5, 6].map((i) => (
-              <div key={i} className="skeleton aspect-square rounded-lg" />
-            ))}
-          </div>
-        ) : !albums || albums.length === 0 ? (
-          <p className="text-sm text-gray-400 text-center py-8">No albums found in your Google Photos.</p>
-        ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {albums.map((album) => (
-              <button
-                key={album.id}
-                onClick={() => {
-                  setSelectedAlbumId(album.id);
-                  setSelectedPhotos(new Set());
-                }}
-                className="group text-left bg-gray-50 rounded-lg overflow-hidden border border-gray-200 hover:border-primary-300 hover:shadow-md transition-all"
-              >
-                <div className="aspect-square bg-gray-200 overflow-hidden">
-                  {album.cover_photo_url ? (
-                    <img src={album.cover_photo_url} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform" loading="lazy" />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-gray-400">
-                      <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                      </svg>
-                    </div>
-                  )}
-                </div>
-                <div className="p-2">
-                  <p className="text-sm font-medium text-gray-900 truncate">{album.title}</p>
-                  <p className="text-xs text-gray-400">{album.item_count ?? '?'} items</p>
-                </div>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // Album items view
   return (
-    <div>
-      <div className="flex items-center justify-between mb-3">
-        <button
-          onClick={() => {
-            setSelectedAlbumId(null);
-            setSelectedPhotos(new Set());
-          }}
-          className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-          </svg>
-          Back to albums
-        </button>
-        <div className="flex items-center gap-2">
-          {selectedPhotos.size > 0 && (
-            <button
-              onClick={importSelected}
-              disabled={importMutation.isPending}
-              className="px-3 py-1.5 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 disabled:opacity-50 transition-colors"
-            >
-              Import {selectedPhotos.size} selected
-            </button>
-          )}
-          <button
-            onClick={importAll}
-            disabled={importMutation.isPending || !albumItems?.length}
-            className="px-3 py-1.5 bg-white border border-gray-300 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50 transition-colors"
-          >
-            Import All
-          </button>
-        </div>
+    <div className="text-center py-8">
+      <div className="w-16 h-16 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+        <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
       </div>
 
-      {itemsLoading ? (
-        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-          {[1, 2, 3, 4, 5, 6, 7, 8].map((i) => (
-            <div key={i} className="skeleton aspect-square rounded-lg" />
-          ))}
-        </div>
-      ) : (
-        <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-          {albumItems?.map((item) => {
-            const isSelected = selectedPhotos.has(item.id);
-            return (
-              <button
-                key={item.id}
-                onClick={() => togglePhoto(item.id)}
-                className={`relative aspect-square rounded-lg overflow-hidden border-2 transition-all ${
-                  isSelected
-                    ? 'border-primary-500 shadow-md'
-                    : 'border-transparent hover:border-gray-300'
-                }`}
-              >
-                <img
-                  src={item.thumbnail_url || item.base_url}
-                  alt=""
-                  className="w-full h-full object-cover"
-                  loading="lazy"
-                />
-                {isSelected && (
-                  <div className="absolute inset-0 bg-primary-500/20 flex items-center justify-center">
-                    <div className="w-6 h-6 bg-primary-600 rounded-full flex items-center justify-center">
-                      <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                      </svg>
-                    </div>
-                  </div>
-                )}
-              </button>
-            );
-          })}
+      {status === 'idle' && (
+        <>
+          <p className="text-gray-600 mb-1">Import from Google Photos</p>
+          <p className="text-sm text-gray-400 mb-4">
+            Opens Google's photo picker where you select the images to import
+          </p>
+          <button
+            onClick={startPicker}
+            className="px-6 py-2.5 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors"
+          >
+            Open Google Photos
+          </button>
+        </>
+      )}
+
+      {status === 'picking' && (
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-6 h-6 border-2 border-primary-600 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-gray-600">Opening Google Photos picker...</p>
         </div>
       )}
 
-      {importMutation.isPending && (
-        <div className="mt-4 flex items-center justify-center gap-2 text-sm text-primary-600">
-          <div className="w-4 h-4 border-2 border-primary-600 border-t-transparent rounded-full animate-spin" />
-          Importing photos...
+      {status === 'polling' && (
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-6 h-6 border-2 border-primary-600 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-gray-600">Waiting for you to select photos...</p>
+          <p className="text-xs text-gray-400">Select photos in the Google Photos window, then close it</p>
+        </div>
+      )}
+
+      {status === 'importing' && (
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-6 h-6 border-2 border-primary-600 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-gray-600">Importing selected photos...</p>
         </div>
       )}
     </div>
@@ -202,7 +130,7 @@ export default function Upload() {
   const fileInputRef = useRef(null);
   const [showCamera, setShowCamera] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [activeTab, setActiveTab] = useState('upload'); // 'upload' | 'camera' | 'photos'
+  const [activeTab, setActiveTab] = useState('upload');
 
   const uploadMutation = useMutation({
     mutationFn: uploadDocuments,
@@ -367,11 +295,11 @@ export default function Upload() {
 
       {/* Google Photos tab */}
       {activeTab === 'photos' && (
-        <AlbumBrowser
+        <GooglePhotosPicker
           onImport={(data) => {
             queryClient.invalidateQueries({ queryKey: ['documents'] });
-            if (data?.id) {
-              navigate(`/documents/${data.id}`);
+            if (data?.document_id) {
+              navigate(`/documents/${data.document_id}`);
             } else {
               navigate('/documents');
             }

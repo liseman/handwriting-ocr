@@ -8,6 +8,7 @@ import DocumentView from './pages/DocumentView';
 import Search from './pages/Search';
 import Play from './pages/Play';
 import Model from './pages/Model';
+import Calibrate from './pages/Calibrate';
 
 function ProtectedRoute({ children }) {
   const { isAuthenticated, loading } = useAuth();
@@ -94,6 +95,15 @@ export default function App() {
         element={
           <ProtectedRoute>
             <Model />
+          </ProtectedRoute>
+        }
+      />
+
+      <Route
+        path="/calibrate"
+        element={
+          <ProtectedRoute>
+            <Calibrate />
           </ProtectedRoute>
         }
       />

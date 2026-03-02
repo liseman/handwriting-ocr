@@ -1,10 +1,13 @@
 """Authentication routes -- Google OAuth2 login / callback / me / logout."""
 
+import logging
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from app.auth import (
     create_access_token,
@@ -23,7 +26,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.get("/login")
 async def login(request: Request) -> RedirectResponse:
     """Redirect the browser to Google's OAuth2 consent screen."""
-    redirect_uri = str(request.url_for("auth_callback"))
+    # Build the callback URL via FRONTEND_URL so login + callback share
+    # the same origin and the session cookie (with OAuth state) is sent.
+    redirect_uri = f"{settings.FRONTEND_URL}/api/auth/callback"
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
@@ -35,7 +40,12 @@ async def callback(request: Request, db: AsyncSession = Depends(get_db)) -> Redi
     mints a JWT, and redirects back to the frontend with the token as a
     query parameter so the SPA can store it.
     """
-    token_data = await oauth.google.authorize_access_token(request)
+    try:
+        token_data = await oauth.google.authorize_access_token(request)
+    except Exception:
+        logger.exception("authorize_access_token failed")
+        # Redirect back to login instead of returning a 500
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/login?error=auth_failed")
 
     # The id_token is already verified by authlib; extract user info.
     userinfo: dict = token_data.get("userinfo", {})
@@ -48,11 +58,11 @@ async def callback(request: Request, db: AsyncSession = Depends(get_db)) -> Redi
     picture: str | None = userinfo.get("picture")
 
     user = await get_or_create_user(db, google_id=google_id, email=email, name=name, picture_url=picture)
-    await db.commit()
 
-    # Store the Google access token in the session so we can call
+    # Store the Google access token in the DB so we can call
     # Google Photos API on behalf of the user later.
-    request.session["google_access_token"] = token_data.get("access_token")
+    user.google_access_token = token_data.get("access_token")
+    await db.commit()
 
     jwt_token = create_access_token(data={"sub": str(user.id)})
 

@@ -129,12 +129,17 @@ class FineTuner:
         return max(versions) if versions else 0
 
     def _latest_lora_path(self, user_id: int) -> Optional[Path]:
-        """Return the path to the latest LoRA weights, or None."""
+        """Return the path to the latest LoRA weights, or None.
+
+        Only returns a path if the adapter was fully saved (adapter_config.json exists).
+        """
         version = self._latest_version(user_id)
         if version == 0:
             return None
         path = self._user_dir(user_id) / f"v{version}"
-        return path if path.exists() else None
+        if path.exists() and (path / "adapter_config.json").exists():
+            return path
+        return None
 
     # ----- data preparation ------------------------------------------------
 
@@ -272,6 +277,7 @@ class FineTuner:
             dataloader_pin_memory=False,
             remove_unused_columns=False,
             report_to="none",
+            average_tokens_across_devices=False,
         )
 
         collator = TrOCRDataCollator()

@@ -1,26 +1,25 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { listDocuments, uploadDocuments, captureCamera, deleteDocument, getPlayItems } from '../api';
+import { listDocuments, uploadDocuments, captureCamera, deleteDocument, getPlayItems, getProcessingStatus } from '../api';
 import { useToast } from '../hooks/useToast';
 import CameraCapture from '../components/CameraCapture';
 
 function DocumentCard({ doc, onDelete }) {
+  const navigate = useNavigate();
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const statusColors = {
-    pending: 'bg-gray-100 text-gray-600',
-    processing: 'bg-amber-100 text-amber-700',
-    completed: 'bg-green-100 text-green-700',
-    error: 'bg-red-100 text-red-700',
+    new: 'bg-gray-100 text-gray-600',
+    processed: 'bg-green-100 text-green-700',
   };
 
-  const statusLabel = doc.ocr_status || doc.status || 'pending';
+  const statusLabel = (doc.ocr_result_count || 0) > 0 ? 'processed' : 'new';
 
   return (
-    <Link
-      to={`/documents/${doc.id}`}
-      className="block bg-white rounded-xl border border-gray-200 hover:border-primary-300 hover:shadow-md transition-all p-4 group"
+    <div
+      onClick={() => navigate(`/documents/${doc.id}`)}
+      className="block bg-white rounded-xl border border-gray-200 hover:border-primary-300 hover:shadow-md transition-all p-4 group cursor-pointer"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
@@ -35,12 +34,11 @@ function DocumentCard({ doc, onDelete }) {
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${statusColors[statusLabel] || statusColors.pending}`}>
+          <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${statusColors[statusLabel] || statusColors.new}`}>
             {statusLabel}
           </span>
           <button
             onClick={(e) => {
-              e.preventDefault();
               e.stopPropagation();
               if (confirmDelete) {
                 onDelete(doc.id);
@@ -63,28 +61,7 @@ function DocumentCard({ doc, onDelete }) {
           </button>
         </div>
       </div>
-
-      {/* Thumbnail strip */}
-      {doc.pages && doc.pages.length > 0 && (
-        <div className="mt-3 flex gap-1.5 overflow-x-auto">
-          {doc.pages.slice(0, 5).map((page, i) => (
-            <div
-              key={page.id || i}
-              className="w-12 h-16 bg-gray-100 rounded border border-gray-200 shrink-0 overflow-hidden"
-            >
-              {page.thumbnail_url && (
-                <img src={page.thumbnail_url} alt="" className="w-full h-full object-cover" loading="lazy" />
-              )}
-            </div>
-          ))}
-          {doc.pages.length > 5 && (
-            <div className="w-12 h-16 bg-gray-50 rounded border border-gray-200 shrink-0 flex items-center justify-center text-xs text-gray-400">
-              +{doc.pages.length - 5}
-            </div>
-          )}
-        </div>
-      )}
-    </Link>
+    </div>
   );
 }
 
@@ -119,6 +96,31 @@ export default function Dashboard() {
     queryFn: getPlayItems,
     retry: false,
   });
+
+  // Poll for processing status to show notifications.
+  const processingSeenRef = useRef(new Set());
+  const { data: processingStatus } = useQuery({
+    queryKey: ['processingStatus'],
+    queryFn: getProcessingStatus,
+    refetchInterval: 3000,
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (!processingStatus?.pages) return;
+    for (const p of processingStatus.pages) {
+      const key = `${p.page_id}`;
+      if (p.status === 'done' && !processingSeenRef.current.has(key)) {
+        processingSeenRef.current.add(key);
+        toast.success(`OCR complete: ${p.document_name}`);
+        queryClient.invalidateQueries({ queryKey: ['documents'] });
+        queryClient.invalidateQueries({ queryKey: ['playItems'] });
+      } else if (p.status === 'error' && !processingSeenRef.current.has(key)) {
+        processingSeenRef.current.add(key);
+        toast.error(`OCR failed: ${p.document_name}`);
+      }
+    }
+  }, [processingStatus, toast, queryClient]);
 
   const uploadMutation = useMutation({
     mutationFn: uploadDocuments,
@@ -187,7 +189,9 @@ export default function Dashboard() {
     );
   }) || [];
 
-  const playCount = Array.isArray(playItems) ? playItems.length : playItems?.count ?? 0;
+  const playCount = playItems?.items?.length
+    ? playItems.items.length + (playItems.remaining || 0)
+    : 0;
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-6">
@@ -195,6 +199,15 @@ export default function Dashboard() {
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-bold text-gray-900">Documents</h1>
         <div className="flex items-center gap-2">
+          <Link
+            to="/calibrate"
+            className="flex items-center gap-1.5 px-3 py-2 bg-purple-50 text-purple-700 rounded-lg text-sm font-medium hover:bg-purple-100 transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+            </svg>
+            Calibrate
+          </Link>
           {playCount > 0 && (
             <Link
               to="/play"

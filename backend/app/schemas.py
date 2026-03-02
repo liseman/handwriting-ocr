@@ -45,11 +45,31 @@ class PageOut(BaseModel):
     id: int
     document_id: int
     image_path: str
+    image_url: str = ""
     page_number: int
+    rotation: int = 0
+    crop_x: Optional[int] = None
+    crop_y: Optional[int] = None
+    crop_w: Optional[int] = None
+    crop_h: Optional[int] = None
+    processing_status: str = "idle"
     created_at: datetime.datetime
     ocr_results: List[OcrResultOut] = []
 
     model_config = {"from_attributes": True}
+
+    def model_post_init(self, __context) -> None:
+        """Convert the filesystem image_path to a browser-serveable URL."""
+        if self.image_path and not self.image_url:
+            # image_path looks like ./data/uploads/1/abc.heic
+            # Static mount serves /uploads from ./data/uploads
+            # So strip the ./data/ prefix
+            path = self.image_path
+            if path.startswith("./data/"):
+                path = path[len("./data/"):]
+            elif path.startswith("data/"):
+                path = path[len("data/"):]
+            self.image_url = f"/api/{path}"
 
 
 class DocumentOut(BaseModel):
@@ -71,6 +91,7 @@ class DocumentListItem(BaseModel):
     source: str
     created_at: datetime.datetime
     page_count: int = 0
+    ocr_result_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -88,6 +109,10 @@ class CorrectionOut(BaseModel):
     ocr_result_id: int
     original_text: str
     corrected_text: str
+    corrected_bbox_x: Optional[int] = None
+    corrected_bbox_y: Optional[int] = None
+    corrected_bbox_w: Optional[int] = None
+    corrected_bbox_h: Optional[int] = None
     created_at: datetime.datetime
 
     model_config = {"from_attributes": True}
@@ -124,6 +149,7 @@ class PlayItem(BaseModel):
     ocr_result_id: int
     page_id: int
     page_image_path: str
+    image_url: str = ""
     bbox_x: int
     bbox_y: int
     bbox_w: int
@@ -131,6 +157,17 @@ class PlayItem(BaseModel):
     recognized_text: str
     confidence: float
     document_name: str
+    page_rotation: int = 0
+
+    def model_post_init(self, __context) -> None:
+        """Convert the filesystem page_image_path to a browser-serveable URL."""
+        if self.page_image_path and not self.image_url:
+            path = self.page_image_path
+            if path.startswith("./data/"):
+                path = path[len("./data/"):]
+            elif path.startswith("data/"):
+                path = path[len("data/"):]
+            self.image_url = f"/api/{path}"
 
 
 class PlayBatchResponse(BaseModel):
@@ -141,6 +178,10 @@ class PlayBatchResponse(BaseModel):
 class PlaySubmit(BaseModel):
     ocr_result_id: int
     corrected_text: str = Field(..., min_length=1)
+    corrected_bbox_x: Optional[int] = None
+    corrected_bbox_y: Optional[int] = None
+    corrected_bbox_w: Optional[int] = None
+    corrected_bbox_h: Optional[int] = None
 
 
 # ── Model / Fine-tuning ─────────────────────────────────────────────────────
@@ -169,6 +210,19 @@ class TrainRequest(BaseModel):
     """Optional parameters for fine-tuning."""
     epochs: int = Field(default=3, ge=1, le=50)
     learning_rate: float = Field(default=1e-4, gt=0)
+
+
+class CalibrateRequest(BaseModel):
+    """Request body for the calibrate endpoint."""
+    page_id: int
+    bbox_x: int
+    bbox_y: int
+    bbox_w: int
+    bbox_h: int
+    ground_truth: str = Field(
+        default="The quick brown fox jumps over the lazy gray dog.",
+        min_length=1,
+    )
 
 
 class TrainResponse(BaseModel):
