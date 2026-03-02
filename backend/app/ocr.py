@@ -752,14 +752,18 @@ What clockwise rotation in degrees (0, 90, 180, or 270) would make the text read
 
 Reply with ONLY a single number: 0, 90, 180, or 270"""
 
-GEMINI_OCR_PROMPT = """You are an expert handwriting OCR system. Transcribe ALL the handwritten text in this image.
+GEMINI_OCR_PROMPT = """Transcribe ALL handwritten text in this image. For each line, return the text and a tight bounding box.
+
+Return a JSON array. Each element: {"text": "...", "box": [y1, x1, y2, x2]}
+Coordinates are normalized 0-1000 (0=top/left edge, 1000=bottom/right edge).
 
 Rules:
-- Output each line of handwritten text on its own line
-- Be extremely precise — capture every word, number, and punctuation mark
-- Preserve the line-by-line structure of the original handwriting
-- Output ONLY the transcribed text, nothing else (no labels, no numbering)
-- If no handwritten text is visible, respond with EMPTY"""
+- One element per physical line of handwriting
+- Bounding box should tightly fit the ink of that line
+- Capture every word, number, and punctuation mark precisely
+- Order top to bottom, left to right
+- Output ONLY the JSON array
+- If no text: return []"""
 
 GEMINI_SINGLE_PROMPT = """You are an expert handwriting OCR system. This image shows a cropped region of handwritten text.
 
@@ -786,7 +790,7 @@ class GeminiOcrEngine:
         self.model_name = "gemini-2.5-flash"
         logger.info("Gemini OCR engine initialized (%s)", self.model_name)
 
-    def _call(self, prompt: str, image: Image.Image, max_tokens: int = 16384) -> str:
+    def _call(self, prompt: str, image: Image.Image, max_tokens: int = 16384, temperature: float = 0.0) -> str:
         """Send a prompt + image to Gemini and return the text response."""
         from google.genai import types
 
@@ -794,7 +798,7 @@ class GeminiOcrEngine:
             model=self.model_name,
             contents=[prompt, image],
             config=types.GenerateContentConfig(
-                temperature=0.1,
+                temperature=temperature,
                 max_output_tokens=max_tokens,
             ),
         )
@@ -839,11 +843,13 @@ class GeminiOcrEngine:
         rotation: int = 0,
         crop: dict | None = None,
     ) -> GeminiOcrResult:
-        """Send full page image to Gemini for OCR.
+        """Send full page image to Gemini for OCR with bounding boxes.
 
-        Uses Gemini for transcription, then matches text lines to actual
-        line positions found via horizontal projection profiles.
+        Gemini returns both text and bounding box coordinates for each line,
+        so no separate line detection step is needed.
         """
+        import json as _json
+
         image = preprocess_image(image_path, rotation=rotation)
 
         crop_offset_x = 0
@@ -856,34 +862,101 @@ class GeminiOcrEngine:
 
         img_width, img_height = image.size
 
-        # Transcribe with Gemini (handles any orientation natively).
+        # Ask Gemini for text + bounding boxes in one call (temperature=0 for
+        # consistent bbox coordinates).
         try:
-            raw_text = self._call(GEMINI_OCR_PROMPT, image)
+            raw_text = self._call(GEMINI_OCR_PROMPT, image, temperature=0.0)
             logger.info("Gemini OCR raw response (%d chars): %.300s", len(raw_text), raw_text)
         except Exception:
             logger.exception("Gemini OCR API call failed for %s", image_path)
             return GeminiOcrResult(rotation=0, segments=[])
 
-        if raw_text == "EMPTY" or not raw_text:
+        if not raw_text or raw_text.strip() == "[]":
             return GeminiOcrResult(rotation=0, segments=[])
 
-        text_lines = [line for line in raw_text.split("\n") if line.strip()]
-        if not text_lines:
-            return GeminiOcrResult(rotation=0, segments=[])
+        # Parse JSON response — strip markdown fences if present.
+        entries = self._parse_gemini_json(raw_text)
+        if entries is None:
+            # Fallback: treat response as plain text lines.
+            text_lines = [l for l in raw_text.split("\n") if l.strip()]
+            line_bboxes = _find_line_positions(image, len(text_lines))
+            segments: list[OcrSegment] = []
+            for i, text in enumerate(text_lines):
+                if i < len(line_bboxes):
+                    bx, by, bw, bh = line_bboxes[i]
+                else:
+                    last_y = line_bboxes[-1][1] + line_bboxes[-1][3] if line_bboxes else 0
+                    bx, by, bw, bh = 0, last_y, img_width, 30
+                segments.append(OcrSegment(
+                    text=text.strip(), confidence=0.95,
+                    bbox=(bx + crop_offset_x, by + crop_offset_y, bw, bh),
+                ))
+            return GeminiOcrResult(rotation=0, segments=segments)
 
-        # Step 3: Find actual line positions via projection profiles.
-        line_bboxes = _find_line_positions(image, len(text_lines))
+        segments = self._entries_to_segments(
+            entries, img_width, img_height, crop_offset_x, crop_offset_y,
+        )
 
+        logger.info(
+            "Gemini OCR: %d segments with bboxes for %s",
+            len(segments), image_path,
+        )
+        return GeminiOcrResult(rotation=0, segments=segments)
+
+    @staticmethod
+    def _parse_gemini_json(raw_text: str) -> list | None:
+        """Parse Gemini JSON response, stripping markdown fences. Returns None on failure."""
+        import json as _json
+
+        json_str = raw_text.strip()
+        if json_str.startswith("```"):
+            lines = json_str.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            json_str = "\n".join(lines)
+
+        try:
+            entries = _json.loads(json_str)
+        except _json.JSONDecodeError:
+            logger.warning("Failed to parse Gemini JSON response")
+            return None
+
+        if not isinstance(entries, list):
+            return None
+        return entries
+
+    @staticmethod
+    def _entries_to_segments(
+        entries: list,
+        img_width: int,
+        img_height: int,
+        crop_offset_x: int = 0,
+        crop_offset_y: int = 0,
+    ) -> list[OcrSegment]:
+        """Convert parsed Gemini JSON entries to OcrSegment list."""
         segments: list[OcrSegment] = []
-        for i, text in enumerate(text_lines):
-            if i < len(line_bboxes):
-                bx, by, bw, bh = line_bboxes[i]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            text = entry.get("text", "").strip()
+            box = entry.get("box")
+            if not text:
+                continue
+
+            if box and len(box) == 4:
+                y1, x1, y2, x2 = box
+                bx = int(x1 / 1000.0 * img_width)
+                by = int(y1 / 1000.0 * img_height)
+                bw = int((x2 - x1) / 1000.0 * img_width)
+                bh = int((y2 - y1) / 1000.0 * img_height)
+                bx = max(0, min(bx, img_width - 1))
+                by = max(0, min(by, img_height - 1))
+                bw = max(1, min(bw, img_width - bx))
+                bh = max(1, min(bh, img_height - by))
             else:
-                # Fallback: put extra lines after the last detected position.
-                last_y = line_bboxes[-1][1] + line_bboxes[-1][3] if line_bboxes else 0
-                bx, by, bw, bh = 0, last_y, img_width, 30
+                bx, by, bw, bh = 0, 0, img_width, 30
+
             segments.append(OcrSegment(
-                text=text.strip(),
+                text=text,
                 confidence=0.95,
                 bbox=(
                     bx + crop_offset_x,
@@ -892,12 +965,7 @@ class GeminiOcrEngine:
                     bh,
                 ),
             ))
-
-        logger.info(
-            "Gemini OCR: %d lines, %d bboxes for %s",
-            len(text_lines), len(line_bboxes), image_path,
-        )
-        return GeminiOcrResult(rotation=0, segments=segments)
+        return segments
 
     def process_single(self, image: Image.Image) -> tuple[str, float]:
         """Run OCR on a single cropped image region.

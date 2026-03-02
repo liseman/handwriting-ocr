@@ -83,10 +83,9 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
 
                 logger.info("Running Gemini OCR on page %d", page_id)
 
-                # Auto-rotate: ask Gemini to detect orientation.
-                # Apply rotation in-memory (not baked to file) to avoid
-                # double-rotation on re-processing.
-                effective_rotation = page.rotation
+                # Auto-rotate: detect orientation and bake into file.
+                # page.rotation != 0 means we already auto-rotated this
+                # page — skip detection to prevent double-rotation.
                 if page.rotation == 0:
                     from app.ocr import preprocess_image as _pi
                     raw_img = await asyncio.to_thread(_pi, page.image_path, 0)
@@ -98,11 +97,16 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
                             "Auto-rotate page %d: Gemini detected %d°",
                             page_id, detected_rot,
                         )
-                        effective_rotation = detected_rot
+                        new_path = _bake_rotation(page.image_path, detected_rot)
+                        page.image_path = new_path
+                        page.rotation = detected_rot  # flag: already rotated
+                        await db.flush()
 
+                # Process with rotation=0 — file is already correctly
+                # oriented (either originally or after baking above).
                 gemini_result = await asyncio.to_thread(
                     gemini.process_page,
-                    page.image_path, effective_rotation,
+                    page.image_path, 0,
                 )
 
                 segments = gemini_result.segments
