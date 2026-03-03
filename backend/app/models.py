@@ -61,6 +61,9 @@ class Page(Base):
     crop_y: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     crop_w: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     crop_h: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    page_warped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )  # 0/1 flag: whether perspective warp has been applied
     processing_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="idle", server_default="idle"
     )  # idle | processing | done | error

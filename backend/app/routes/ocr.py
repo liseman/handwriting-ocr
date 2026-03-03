@@ -39,8 +39,8 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
 
     from app.database import async_session  # local import to avoid circulars
     from app.ocr import (
-        detect_content_bounds, get_engine, get_gemini_engine,
-        has_gemini, preprocess_image,
+        deskew_page, detect_content_bounds, get_engine, get_gemini_engine,
+        has_gemini, perspective_warp_page, preprocess_image,
     )
     from app.routes.documents import _bake_rotation
     from app.routes.search import index_ocr_result
@@ -101,6 +101,44 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
                         page.image_path = new_path
                         page.rotation = detected_rot  # flag: already rotated
                         await db.flush()
+
+                # Perspective warp: detect page corners and warp to
+                # extract just the page, removing desk/background.
+                if not page.page_warped:
+                    warp_img = await asyncio.to_thread(
+                        preprocess_image, page.image_path, 0,
+                    )
+                    corners = await asyncio.to_thread(
+                        gemini.detect_page_corners, warp_img,
+                    )
+                    if corners is not None:
+                        new_path = await asyncio.to_thread(
+                            perspective_warp_page, page.image_path, corners,
+                        )
+                        if new_path is not None:
+                            logger.info(
+                                "Page %d warped: %s → %s",
+                                page_id, page.image_path, new_path,
+                            )
+                            page.image_path = new_path
+                            # Clear crop — it was relative to the old image.
+                            page.crop_x = None
+                            page.crop_y = None
+                            page.crop_w = None
+                            page.crop_h = None
+                    # Deskew: correct small text skew after warp.
+                    deskewed_path = await asyncio.to_thread(
+                        deskew_page, page.image_path,
+                    )
+                    if deskewed_path is not None:
+                        logger.info(
+                            "Page %d deskewed: %s → %s",
+                            page_id, page.image_path, deskewed_path,
+                        )
+                        page.image_path = deskewed_path
+
+                    page.page_warped = 1
+                    await db.flush()
 
                 # Process with rotation=0 — file is already correctly
                 # oriented (either originally or after baking above).

@@ -52,6 +52,7 @@ class PageOut(BaseModel):
     crop_y: Optional[int] = None
     crop_w: Optional[int] = None
     crop_h: Optional[int] = None
+    page_warped: bool = False
     processing_status: str = "idle"
     created_at: datetime.datetime
     ocr_results: List[OcrResultOut] = []

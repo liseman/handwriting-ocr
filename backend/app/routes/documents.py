@@ -404,6 +404,7 @@ async def rotate_page(
     new_path = _bake_rotation(page.image_path, body.rotation)
     page.image_path = new_path
     page.rotation = 0
+    page.page_warped = 0  # re-detect page corners on next OCR run
 
     # Clear crop (coords were relative to old orientation).
     page.crop_x = None

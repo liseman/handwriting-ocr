@@ -29,6 +29,17 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # Lightweight migrations for new columns on existing tables.
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(
+                text("ALTER TABLE pages ADD COLUMN page_warped INTEGER NOT NULL DEFAULT 0")
+            )
+        except Exception:
+            pass  # column already exists
+
     yield
 
     # Shutdown: dispose of the engine connection pool.
