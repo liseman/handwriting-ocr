@@ -1,14 +1,17 @@
 # Handwriting OCR
 
-A web application that converts handwritten documents to text using OCR, then learns your handwriting over time through corrections. Upload photos of handwritten pages, get instant transcriptions, correct mistakes through a gamified "Play" mode, and watch accuracy improve as the model fine-tunes to your writing style.
+A web application that converts handwritten documents to text using OCR, then learns your handwriting over time through corrections. Upload or photograph handwritten pages (or import from Google Photos), get instant transcriptions via Gemini Flash or TrOCR, and correct mistakes through a gamified "Play" mode. Corrections feed back into per-user LoRA fine-tuning, improving accuracy over time.
 
 ## Features
 
-- **Dual OCR Engine** -- Gemini Flash API (primary, high-quality) with TrOCR local fallback
-- **Auto-rotation** -- Automatically detects and corrects image orientation
+- **Dual OCR Engine** -- Gemini 2.5 Flash API (primary, high-quality) with TrOCR local fallback
+- **Auto-rotation** -- Detects and corrects image orientation (Gemini: single-prompt detection; TrOCR: tries all 4 orientations)
+- **Perspective Warp** -- Detects notebook page corners in camera photos and applies perspective transform to remove desk/background, producing a clean rectangular page image
+- **Deskew** -- Straightens small text skew via Hough line detection so bounding boxes align with horizontal text
+- **Ink-Aware Bbox Alignment** -- Detects actual ink line positions using Otsu binarization + horizontal projection, then snaps Gemini's bounding boxes to real text positions (corrects spacing drift on long pages)
 - **Auto-crop** -- Detects content bounds to focus OCR on the writing area
-- **Line Detection** -- Paper-aware ink detection with horizontal projection profiles finds individual text lines
 - **Custom Bounding Boxes** -- Draw boxes on the page to OCR specific regions
+- **Bbox Training Mode** -- Manually redraw bounding boxes for any OCR result to correct alignment
 - **Play Mode** -- Gamified correction interface that prioritizes low-confidence results
 - **Personalized Fine-tuning** -- Per-user LoRA adapters trained on your corrections
 - **Calibration** -- Bootstrap training with a single handwriting sample
@@ -73,18 +76,18 @@ docker compose up --build
 handwriting-ocr/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py          # FastAPI app, CORS, lifespan
+│   │   ├── main.py          # FastAPI app, CORS, lifespan, DB migration
 │   │   ├── auth.py          # JWT token verification
 │   │   ├── config.py        # Pydantic settings
-│   │   ├── database.py      # SQLAlchemy async engine
+│   │   ├── database.py      # SQLAlchemy async engine (SQLite w/ 30s busy timeout)
 │   │   ├── models.py        # ORM models (User, Document, Page, OcrResult, Correction, UserModel)
 │   │   ├── schemas.py       # Pydantic request/response schemas
-│   │   ├── ocr.py           # OCR engines (Gemini + TrOCR), line detection, ink analysis
+│   │   ├── ocr.py           # OCR engines, image processing, bbox alignment
 │   │   ├── finetune.py      # LoRA fine-tuning pipeline
 │   │   └── routes/
 │   │       ├── auth.py          # Google OAuth login/callback, JWT
 │   │       ├── documents.py     # Upload, camera, CRUD, rotate, crop
-│   │       ├── ocr.py           # Trigger OCR, get results, process bbox
+│   │       ├── ocr.py           # Trigger OCR, get results, process bbox, train bbox
 │   │       ├── corrections.py   # Submit corrections, Play mode batches
 │   │       ├── search.py        # Full-text search (Whoosh)
 │   │       ├── photos.py        # Google Photos Picker import
@@ -96,13 +99,13 @@ handwriting-ocr/
 │   │   ├── api.js               # Axios client + all API functions
 │   │   ├── hooks/useAuth.jsx    # Auth context + token management
 │   │   ├── components/
-│   │   │   ├── PageViewer.jsx           # Image viewer with bbox overlays, draw/crop modes
+│   │   │   ├── PageViewer.jsx           # Image viewer with bbox overlays, draw/crop/train modes
 │   │   │   └── BboxHighlightViewer.jsx  # Bbox drawing component (Play, Calibrate)
 │   │   └── pages/
 │   │       ├── Login.jsx         # Google OAuth sign-in
 │   │       ├── Dashboard.jsx     # Document list, upload, navigation
 │   │       ├── Upload.jsx        # Multi-source upload (file, camera, Google Photos)
-│   │       ├── DocumentView.jsx  # Page viewer + OCR results panel
+│   │       ├── DocumentView.jsx  # Page viewer + OCR results + train mode
 │   │       ├── Play.jsx          # Correction game with speech-to-text
 │   │       ├── Search.jsx        # Full-text search
 │   │       ├── Model.jsx         # Training controls + export
@@ -119,19 +122,54 @@ handwriting-ocr/
 ### Data Flow
 
 1. **Upload** -- Images saved to `data/uploads/user_{id}/`, Document + Page rows created
-2. **OCR** -- Auto-rotation detects orientation, line detection finds text regions, OCR engine transcribes each line, results stored with confidence scores and bounding boxes
-3. **Correct** -- Play mode surfaces lowest-confidence results first, user approves or corrects
-4. **Train** -- Corrections crop original images to bounding boxes, LoRA fine-tunes TrOCR decoder attention layers (q_proj, v_proj), new adapter version saved
-5. **Improve** -- Subsequent OCR loads user's LoRA adapter for better accuracy
+2. **Pre-process** -- Auto-rotation detects orientation and bakes into the image file. Perspective warp detects notebook page corners and removes background. Deskew straightens small text skew.
+3. **OCR** -- Gemini (or TrOCR) transcribes the page, returning text with bounding boxes. Ink line detection snaps bounding boxes to actual text positions.
+4. **Correct** -- Play mode surfaces lowest-confidence results first, user approves or corrects
+5. **Train** -- Corrections crop original images to bounding boxes, LoRA fine-tunes TrOCR decoder attention layers (q_proj, v_proj), new adapter version saved
+6. **Improve** -- Subsequent OCR loads user's LoRA adapter for better accuracy
 
 ### OCR Pipeline
 
-The OCR pipeline uses a dual-engine approach:
+The full Gemini OCR pipeline for a page:
+
+```
+Camera Photo
+    │
+    ▼
+┌─────────────────┐
+│  Auto-Rotation   │  Gemini detects orientation → bake rotation into file
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│ Perspective Warp │  Gemini detects 4 page corners → OpenCV warpPerspective
+└────────┬────────┘  removes desk/hands/background → clean page rectangle
+         ▼
+┌─────────────────┐
+│     Deskew       │  Hough line detection → rotate to straighten text
+└────────┬────────┘
+         ▼
+┌─────────────────┐
+│   Gemini OCR     │  Full-page prompt → returns JSON array of
+└────────┬────────┘  {text, box: [y1,x1,y2,x2]} entries (0-1000 normalized)
+         ▼
+┌─────────────────┐
+│  Ink Detection   │  Otsu binarization → horizontal projection →
+└────────┬────────┘  find actual text line positions in the image
+         ▼
+┌─────────────────┐
+│  Bbox Alignment  │  Sequential matching: snap each Gemini text line
+└────────┬────────┘  to nearest detected ink line (fixes spacing drift)
+         ▼
+    OCR Results
+    (text + aligned bboxes)
+```
 
 **Gemini Flash** (when `GEMINI_API_KEY` is set):
-- Sends full page image to Gemini for transcription
-- Auto-rotation via orientation detection prompt
-- Line positions mapped using paper-aware ink detection + horizontal projection peaks
+- Sends full page image to Gemini 2.5 Flash for transcription with bounding boxes
+- Auto-rotation via single-prompt orientation detection (0/90/180/270)
+- Perspective warp uses Gemini to detect page corners, with 2% outward padding to avoid trimming content
+- Bounding box alignment corrects Gemini's uniform y-spacing grid (which drifts from actual ruled-line spacing on notebook pages) by detecting real ink positions via Otsu binarization + horizontal projection
+- API calls include automatic retry (3 attempts with exponential backoff) for transient network errors
 
 **TrOCR** (local fallback):
 - `microsoft/trocr-large-handwritten` via HuggingFace Transformers
@@ -139,12 +177,15 @@ The OCR pipeline uses a dual-engine approach:
 - Auto-rotation by trying all 4 orientations, keeping highest confidence
 - Confidence from average token log-probabilities
 
-**Line Detection** (`_find_line_positions`):
-- Paper-aware ink detection separates ink from paper background
-- Spine removal for notebook photos (only narrow vertical features)
-- Gaussian-smoothed horizontal projection with adaptive sigma
-- Peak detection with midpoint boundaries between lines
-- Per-line horizontal extent with gap splitting for two-page spreads
+**Bounding Box Alignment** (`_build_direct_segments`):
+
+Gemini returns text with bounding boxes that use a uniform vertical grid. On notebook pages with ruled lines, this grid spacing (~121px) often differs from the actual line spacing (~109px), causing progressive drift -- by line 25+, boxes can be 300px off from the actual text. The alignment pipeline fixes this:
+
+1. **Ink line detection** (`_detect_ink_lines`): Otsu binarization on the middle 75% of the image width, horizontal projection to find rows with ink, contiguous run detection with minimum height filtering (15px), and automatic splitting of oversized blobs using projection valleys
+2. **Body-start detection**: Identifies header/date lines (which have non-standard spacing to the next line) and excludes them from ink matching
+3. **Sequential matching**: Each Gemini text line (in reading order) is matched to the next available ink line, skipping oversized blobs. This avoids the problem of distance-based matching where Gemini's drifted y-coordinates would match to the wrong ink line
+4. **Extrapolation**: Unmatched lines at the end of the page are spaced using the median ink line spacing from the last matched position
+5. **Height from ink**: Each box height comes from the actual ink line height, not a uniform value
 
 ### Fine-tuning
 
@@ -207,6 +248,7 @@ Copy `.env.example` to `.env`:
 | POST | `/ocr/process-bbox/{page_id}` | OCR drawn region (sync) |
 | GET | `/ocr/results/{page_id}` | Get OCR results |
 | GET | `/ocr/processing-status` | Poll processing state |
+| PUT | `/ocr/result/{result_id}/bbox` | Update result bounding box (train mode) |
 
 ### Corrections
 | Method | Path | Description |
@@ -230,11 +272,11 @@ Copy `.env.example` to `.env`:
 
 ## Tech Stack
 
-**Backend:** FastAPI, SQLAlchemy 2.0 (async), aiosqlite, python-jose (JWT), authlib (OAuth)
+**Backend:** FastAPI, SQLAlchemy 2.0 (async), aiosqlite, python-jose (JWT), authlib (OAuth), OpenCV
 
 **Frontend:** React 19, Vite 6, Tailwind CSS 4, React Router 6, TanStack Query 5, Axios
 
-**ML:** Transformers (TrOCR), PEFT (LoRA), PyTorch, Google GenAI (Gemini Flash)
+**ML/Vision:** Google GenAI (Gemini 2.5 Flash), Transformers (TrOCR), PEFT (LoRA), PyTorch, OpenCV (perspective warp, deskew, ink detection)
 
 **Search:** Whoosh
 

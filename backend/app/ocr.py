@@ -458,15 +458,17 @@ Coordinates are normalized 0-1000 (0=top/left edge, 1000=bottom/right edge).
 
 Output ONLY the JSON array. If no text: return []"""
 
-GEMINI_PAGE_CORNERS_PROMPT = """This is a camera photo. Is there a paper page or notebook visible with non-paper background (desk, table, hands, objects) around it?
+GEMINI_PAGE_CORNERS_PROMPT = """This is a camera photo. Is there a paper page, notebook, or open notebook spread visible with non-paper background (desk, table, hands, objects) around it?
 
-If YES — the paper does NOT fill the entire image and background is clearly visible on at least 2 sides — return the 4 corners of the paper as JSON:
+If YES — return the 4 corners of ALL the paper/pages visible (the entire notebook spread if open) as JSON:
 {"top_left": [x, y], "top_right": [x, y], "bottom_right": [x, y], "bottom_left": [x, y]}
 Coordinates are normalized 0-1000 (0=top/left, 1000=bottom/right).
 
+IMPORTANT: Include ALL pages. For an open notebook, give the outer corners of the entire spread (both pages together). Place corners at the OUTER edge of the paper — do NOT trim into any text or page content. It is much better to include a little background than to cut off any text.
+
 If NO — the paper fills nearly all of the image, or no clear paper boundary exists — return exactly: null
 
-Important: only return corners if there is significant non-paper background visible (more than a thin border). A notebook photo that fills 90%+ of the frame should return null.
+Only return corners if there is significant non-paper background visible (more than a thin border). A notebook photo that fills 90%+ of the frame should return null.
 Output ONLY valid JSON (the object or null), nothing else."""
 
 
@@ -587,7 +589,7 @@ def deskew_page(image_path: str) -> str | None:
     # Use median angle as the skew estimate (robust to outliers).
     angle = float(np.median(angles))
 
-    if abs(angle) < 0.5:
+    if abs(angle) < 0.3:
         logger.info("deskew_page: skew %.2f° too small, skipping", angle)
         return None
     if abs(angle) > 10:
@@ -654,24 +656,34 @@ class GeminiOcrEngine:
         self.model_name = "gemini-2.5-flash"
         logger.info("Gemini OCR engine initialized (%s)", self.model_name)
 
-    def _call(self, prompt: str, image: Image.Image, max_tokens: int = 16384, temperature: float = 0.0) -> str:
+    def _call(self, prompt: str, image: Image.Image, max_tokens: int = 65536, temperature: float = 0.0) -> str:
         """Send a prompt + image to Gemini and return the text response."""
+        import time as _time
         from google.genai import types
 
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=[prompt, image],
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            ),
-        )
-        text = response.text
-        if text is None:
-            logger.warning("Gemini returned None text, finish_reason=%s",
-                           response.candidates[0].finish_reason if response.candidates else "N/A")
-            return ""
-        return text.strip()
+        last_exc = None
+        for attempt in range(3):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[prompt, image],
+                    config=types.GenerateContentConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                text = response.text
+                if text is None:
+                    logger.warning("Gemini returned None text, finish_reason=%s",
+                                   response.candidates[0].finish_reason if response.candidates else "N/A")
+                    return ""
+                return text.strip()
+            except Exception as e:
+                last_exc = e
+                logger.warning("Gemini API attempt %d/3 failed: %s", attempt + 1, e)
+                if attempt < 2:
+                    _time.sleep(2 ** attempt)
+        raise last_exc
 
     def detect_rotation(self, image: Image.Image) -> int:
         """Ask Gemini what rotation is needed to make text upright.
@@ -759,6 +771,23 @@ class GeminiOcrEngine:
                 px = max(0, min(px, img_w - 1))
                 py = max(0, min(py, img_h - 1))
                 corners.append((px, py))
+
+            # Add padding outward from the center to avoid trimming
+            # content at the edges.  ~2% of image dimensions.
+            cx = sum(c[0] for c in corners) / 4
+            cy = sum(c[1] for c in corners) / 4
+            pad_x = int(img_w * 0.02)
+            pad_y = int(img_h * 0.02)
+            padded = []
+            for px, py in corners:
+                dx = 1 if px < cx else -1 if px > cx else 0
+                dy = 1 if py < cy else -1 if py > cy else 0
+                # Push corner away from center (outward).
+                npx = max(0, min(img_w - 1, px - dx * pad_x))
+                npy = max(0, min(img_h - 1, py - dy * pad_y))
+                padded.append((npx, npy))
+            corners = padded
+
             return corners
         except (KeyError, TypeError, IndexError, ValueError):
             logger.warning("Invalid page corners structure: %r", data)
@@ -808,13 +837,23 @@ class GeminiOcrEngine:
             return GeminiOcrResult(rotation=0, segments=[])
 
         # Extract text lines from Gemini response.
+        # Gemini sometimes uses "text_content" instead of "text",
+        # or "box_2d" instead of "box".  Normalise before proceeding.
         entries = self._parse_gemini_json(raw_text)
         if entries is not None:
-            text_lines = [
-                e.get("text", "").strip()
-                for e in entries
-                if isinstance(e, dict) and e.get("text", "").strip()
-            ]
+            # Normalise field names and filter to entries with text.
+            clean_entries: list[dict] = []
+            text_lines: list[str] = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                t = (e.get("text") or e.get("text_content") or "").strip()
+                if not t:
+                    continue
+                box = e.get("box") or e.get("box_2d")
+                clean_entries.append({"text": t, "box": box})
+                text_lines.append(t)
+            entries = clean_entries
         else:
             # Plain text fallback — skip if it looks like broken JSON.
             stripped = raw_text.strip()
@@ -827,11 +866,11 @@ class GeminiOcrEngine:
         if not text_lines:
             return GeminiOcrResult(rotation=0, segments=[])
 
-        # ── Step 2: Build bboxes with CV-corrected Gemini coordinates ──
-        # Gemini's spacing is correct but the absolute y-position is
-        # offset.  CV detects the first ink peak and computes the
-        # shift needed to align boxes with actual text.
-        segments = self._build_cv_aligned_segments(
+        # ── Step 2: Use Gemini's bounding boxes with spacing correction ─
+        # Gemini's x-coordinates are accurate but y-spacing drifts on
+        # long pages (uniform grid vs actual ruled-line spacing).
+        # Detect actual line spacing from the image and re-space lines.
+        segments = self._build_direct_segments(
             text_lines, entries, image, img_width, img_height,
             crop_offset_x, crop_offset_y,
         )
@@ -841,6 +880,400 @@ class GeminiOcrEngine:
             len(text_lines), len(segments), image_path,
         )
         return GeminiOcrResult(rotation=0, segments=segments)
+
+    def _build_direct_segments(
+        self,
+        text_lines: list[str],
+        entries: list | None,
+        image: Image.Image,
+        img_width: int,
+        img_height: int,
+        crop_offset_x: int = 0,
+        crop_offset_y: int = 0,
+    ) -> list[OcrSegment]:
+        """Build segments using Gemini's bounding boxes with spacing correction.
+
+        Gemini's x-coordinates are accurate, but y-coordinates use a uniform
+        grid that drifts from actual ruled-line spacing on notebook pages.
+        We detect the real line spacing from the image via autocorrelation
+        and re-space lines accordingly.
+        """
+        n = len(text_lines)
+        if n == 0:
+            return []
+
+        # ── Parse Gemini boxes into pixel coords ──────────────────
+        raw_boxes: list[tuple[int, int, int, int] | None] = []
+        for i in range(n):
+            box = None
+            if entries and i < len(entries) and isinstance(entries[i], dict):
+                box = entries[i].get("box") or entries[i].get("box_2d")
+            if isinstance(box, list) and len(box) == 4:
+                y1, x1, y2, x2 = box
+                py1 = max(0, int(y1 / 1000.0 * img_height))
+                px1 = max(0, int(x1 / 1000.0 * img_width))
+                py2 = min(img_height, int(y2 / 1000.0 * img_height))
+                px2 = min(img_width, int(x2 / 1000.0 * img_width))
+                raw_boxes.append((px1, py1, px2, py2))
+            else:
+                raw_boxes.append(None)
+
+        # ── Detect actual ink line positions from the image ─────────
+        # Gemini's y-coordinates drift on long pages.  We detect where
+        # ink actually sits using binarization + horizontal projection,
+        # then snap each Gemini text line to the nearest ink line.
+        ink_lines = self._detect_ink_lines(image)
+
+        gemini_ys = []
+        for b in raw_boxes:
+            gemini_ys.append(b[1] if b else None)
+
+        # Match Gemini text lines to ink lines (both in top-to-bottom
+        # order).  Each Gemini line snaps to the nearest unmatched ink
+        # line; if no ink line is close, keep Gemini's y.
+        corrected_ys: list[int | None] = list(gemini_ys)
+        corrected_heights: list[int | None] = [None] * n
+        used_ink: set[int] = set()
+
+        if ink_lines:
+            # Compute median ink spacing and height for filtering.
+            ink_spacings = [ink_lines[k + 1][0] - ink_lines[k][0]
+                            for k in range(len(ink_lines) - 1)]
+            med_spacing = (sorted(ink_spacings)[len(ink_spacings) // 2]
+                           if ink_spacings else 110)
+            ink_heights = sorted(il[3] for il in ink_lines)
+            med_height = ink_heights[len(ink_heights) // 2]
+            max_match_dist = int(med_spacing * 1.5)
+
+            ink_idx = 0
+            last_matched_ink = -1
+            last_matched_gemini = -1
+
+            # Identify body-text start: find first line with typical
+            # spacing to the next line (skip header/date lines).
+            gemini_spacings = []
+            for i in range(n - 1):
+                if gemini_ys[i] is not None and gemini_ys[i + 1] is not None:
+                    gemini_spacings.append(gemini_ys[i + 1] - gemini_ys[i])
+            med_gemini_spacing = (sorted(gemini_spacings)[len(gemini_spacings) // 2]
+                                  if gemini_spacings else 0)
+
+            body_start = 0
+            if med_gemini_spacing > 0:
+                for i in range(n - 1):
+                    if gemini_ys[i] is None or gemini_ys[i + 1] is None:
+                        continue
+                    gap = gemini_ys[i + 1] - gemini_ys[i]
+                    if abs(gap - med_gemini_spacing) < med_gemini_spacing * 0.3:
+                        body_start = i
+                        break
+
+            for i in range(n):
+                gy = gemini_ys[i]
+                if gy is None:
+                    continue
+
+                # Header lines before the body block keep Gemini positions.
+                if i < body_start:
+                    continue
+
+                # Sequential matching: take the NEXT available ink line.
+                j = ink_idx
+                while j < len(ink_lines):
+                    if j in used_ink:
+                        j += 1
+                        continue
+                    # Skip oversized blobs (likely merged header area).
+                    if ink_lines[j][3] > med_height * 2.5:
+                        used_ink.add(j)
+                        j += 1
+                        continue
+                    break
+
+                if j < len(ink_lines):
+                    center, top, bot, ht = ink_lines[j]
+                    if abs(gy - center) < max_match_dist * 2:
+                        corrected_ys[i] = top
+                        corrected_heights[i] = ht
+                        used_ink.add(j)
+                        ink_idx = j + 1
+                        last_matched_ink = j
+                        last_matched_gemini = i
+
+            # Extrapolate for unmatched lines at the end using
+            # spacing from the last few matched lines.
+            if last_matched_gemini >= 0 and last_matched_gemini < n - 1:
+                last_y = corrected_ys[last_matched_gemini]
+                for i in range(last_matched_gemini + 1, n):
+                    if corrected_heights[i] is not None:
+                        continue  # already matched
+                    offset = i - last_matched_gemini
+                    corrected_ys[i] = last_y + offset * med_spacing
+                    corrected_heights[i] = med_height
+
+            matched = sum(1 for i in range(n)
+                          if corrected_heights[i] is not None)
+            logger.info(
+                "Ink-line matching: %d/%d Gemini lines snapped to ink "
+                "(median spacing=%dpx, median height=%dpx)",
+                matched, n, med_spacing, med_height,
+            )
+
+        # ── Build segments ────────────────────────────────────────
+        # Default box height: median ink line height, or Gemini box height.
+        default_bh = 80
+        if ink_lines:
+            heights = sorted(il[3] for il in ink_lines)
+            default_bh = heights[len(heights) // 2]
+
+        segments: list[OcrSegment] = []
+        for i, text in enumerate(text_lines):
+            b = raw_boxes[i]
+            if b is not None:
+                px1, _, px2, _ = b
+                py1 = corrected_ys[i] if corrected_ys[i] is not None else b[1]
+                bw = max(px2 - px1, 5)
+                bh = corrected_heights[i] if corrected_heights[i] else default_bh
+            else:
+                spacing = img_height / max(n + 1, 1)
+                py1 = int(i * spacing)
+                px1, px2 = 0, img_width
+                bw = img_width
+                bh = int(spacing)
+
+            # Clamp to image bounds.
+            py1 = max(0, min(py1, img_height - bh))
+
+            segments.append(OcrSegment(
+                text=text,
+                confidence=0.90,
+                bbox=(px1 + crop_offset_x, py1 + crop_offset_y, bw, bh),
+            ))
+
+        return segments
+
+    @staticmethod
+    def _detect_ink_lines(
+        image: Image.Image,
+    ) -> list[tuple[int, int, int, int]]:
+        """Detect text line positions from ink in the image.
+
+        Returns list of (center_y, top_y, bottom_y, height) tuples,
+        sorted top-to-bottom.  Uses Otsu binarization + horizontal
+        projection to find rows with ink.
+        """
+        import cv2
+
+        gray = np.array(image.convert("L"))
+        h, w = gray.shape
+        if h < 200 or w < 200:
+            return []
+
+        # Binarize (ink = white in result).
+        _, binary = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+
+        # Use middle 75% of width to avoid margin noise.
+        text_area = binary[:, w // 8: 7 * w // 8]
+
+        # Horizontal projection.
+        proj = text_area.sum(axis=1).astype(float) / 255
+
+        # Smooth.
+        kernel = np.ones(3) / 3
+        proj_s = np.convolve(proj, kernel, mode="same")
+
+        # Threshold: rows with significant ink.
+        nz = proj_s[proj_s > 0]
+        if len(nz) == 0:
+            return []
+        threshold = max(float(np.percentile(nz, 25)), 20.0)
+
+        # Find contiguous ink runs.
+        in_text = False
+        line_start = 0
+        raw_lines: list[tuple[int, int, int, int]] = []
+        for y in range(h):
+            if proj_s[y] > threshold:
+                if not in_text:
+                    line_start = y
+                    in_text = True
+            else:
+                if in_text:
+                    ht = y - line_start
+                    if ht > 15:
+                        center = (line_start + y) // 2
+                        raw_lines.append((center, line_start, y, ht))
+                    in_text = False
+
+        if not raw_lines:
+            return []
+
+        # Split oversized blobs that likely contain multiple lines.
+        median_ht = sorted(r[3] for r in raw_lines)[len(raw_lines) // 2]
+        split_threshold = median_ht * 2
+
+        result: list[tuple[int, int, int, int]] = []
+        for center, top, bot, ht in raw_lines:
+            if ht > split_threshold and median_ht > 15:
+                # Split into sub-lines using projection valleys.
+                sub_proj = proj_s[top:bot]
+                min_val = sub_proj.min()
+                split_thresh = (sub_proj.max() + min_val) / 3
+
+                # Find valleys (local minima below threshold).
+                splits = [0]
+                for y in range(10, len(sub_proj) - 10):
+                    if (sub_proj[y] < split_thresh
+                            and sub_proj[y] <= sub_proj[y - 5]
+                            and sub_proj[y] <= sub_proj[y + 5]
+                            and (not splits or y - splits[-1] > median_ht * 0.5)):
+                        splits.append(y)
+                splits.append(len(sub_proj))
+
+                for si in range(len(splits) - 1):
+                    s_top = top + splits[si]
+                    s_bot = top + splits[si + 1]
+                    s_ht = s_bot - s_top
+                    if s_ht > 10:
+                        result.append(((s_top + s_bot) // 2, s_top, s_bot, s_ht))
+            else:
+                result.append((center, top, bot, ht))
+
+        result.sort(key=lambda x: x[0])
+        logger.info("Detected %d ink lines from image", len(result))
+        return result
+
+    def _calibrate_spacing(
+        self,
+        image: Image.Image,
+        text_lines: list[str],
+        raw_boxes: list,
+        gemini_ys: list,
+        anchor_idx: int | None,
+        anchor_y: int | None,
+        gemini_spacing: int | None,
+        img_width: int,
+        img_height: int,
+    ) -> int | None:
+        """Calibrate line spacing by OCR-verifying one line near the page end.
+
+        Searches for the correct y-position of a line at ~75% through the
+        page, then computes exact spacing from anchor to that position.
+        Uses 1-7 Gemini API calls.
+        """
+        if anchor_idx is None or anchor_y is None or gemini_spacing is None:
+            return None
+        if len(text_lines) < 8:
+            return None  # too few lines to calibrate
+
+        # Pick a calibration line at ~75% through the body text.
+        cal_idx = anchor_idx + max(1, int((len(text_lines) - anchor_idx) * 0.75))
+        cal_idx = min(cal_idx, len(text_lines) - 1)
+        if cal_idx <= anchor_idx:
+            return None
+
+        cal_text = text_lines[cal_idx]
+        cal_words = set(cal_text.lower().split()[:5])
+        if len(cal_words) < 2:
+            return None
+
+        # Get x-bounds from the box (or use defaults).
+        b = raw_boxes[cal_idx] if cal_idx < len(raw_boxes) else None
+        if b is not None:
+            bx1, _, bx2, _ = b
+        else:
+            bx1, bx2 = 0, img_width
+
+        # Approximate spacing from autocorrelation for initial estimate.
+        approx_spacing = self._detect_line_spacing(image) or gemini_spacing
+        # Estimate y position.
+        est_y = anchor_y + (cal_idx - anchor_idx) * approx_spacing
+        box_h = approx_spacing
+
+        # Search ±150px around estimate in 15px steps.
+        best_y = None
+        best_overlap = 0.0
+        for offset in range(0, 160, 15):
+            for sign in [0, -1, 1] if offset == 0 else [-1, 1]:
+                y = int(est_y + sign * offset)
+                if y < 0 or y + box_h > img_height:
+                    continue
+                crop = image.crop((bx1, y, bx2, y + box_h))
+                text, _ = self.process_single(crop)
+                got_words = set((text or "").lower().split()[:8])
+                overlap = len(cal_words & got_words) / len(cal_words)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_y = y
+                if overlap >= 0.5:
+                    break
+            if best_overlap >= 0.5:
+                break
+
+        if best_y is None or best_overlap < 0.4:
+            logger.info("Spacing calibration failed for line %d", cal_idx)
+            return None
+
+        # Compute actual spacing from anchor to calibration point.
+        lines_between = cal_idx - anchor_idx
+        actual = int(round((best_y - anchor_y) / lines_between))
+        logger.info(
+            "Spacing calibrated: line %d at y=%d (est=%d, offset=%+d), "
+            "spacing=%dpx (%.1f%% match)",
+            cal_idx, best_y, int(est_y), best_y - int(est_y),
+            actual, best_overlap * 100,
+        )
+        return actual
+
+    @staticmethod
+    def _detect_line_spacing(image: Image.Image) -> int | None:
+        """Detect ruled-line spacing from a notebook page image.
+
+        Uses autocorrelation of the horizontal edge projection to find
+        the dominant periodic spacing (the distance between ruled lines).
+        """
+        import cv2
+
+        gray = np.array(image.convert("L"))
+        h, w = gray.shape
+
+        if h < 200 or w < 200:
+            return None
+
+        # Use middle 80% of width to avoid margin noise.
+        text_area = gray[:, w // 10 : 9 * w // 10]
+        edges = cv2.Canny(text_area, 30, 100)
+        proj = edges.sum(axis=1).astype(float)
+
+        # Autocorrelation.
+        proj_norm = proj - proj.mean()
+        norm_sq = float(np.dot(proj_norm, proj_norm))
+        if norm_sq < 1e-6:
+            return None
+        autocorr = np.correlate(proj_norm, proj_norm, mode="full")
+        autocorr = autocorr[len(autocorr) // 2:]
+        autocorr = autocorr / autocorr[0]
+
+        # Find first significant peak in range [60, 200] pixels.
+        best_lag = None
+        best_val = 0.0
+        for lag in range(60, min(200, len(autocorr) - 1)):
+            if (autocorr[lag] > autocorr[lag - 1]
+                    and autocorr[lag] > autocorr[lag + 1]
+                    and autocorr[lag] > 0.3
+                    and autocorr[lag] > best_val):
+                best_lag = lag
+                best_val = float(autocorr[lag])
+                break  # first peak is the fundamental
+
+        if best_lag is not None:
+            logger.info(
+                "Detected line spacing: %dpx (autocorr=%.3f)",
+                best_lag, best_val,
+            )
+        return best_lag
 
     @staticmethod
     def _build_cv_aligned_segments(
@@ -852,13 +1285,16 @@ class GeminiOcrEngine:
         crop_offset_x: int = 0,
         crop_offset_y: int = 0,
     ) -> list[OcrSegment]:
-        """Build segments using Gemini boxes shifted by a CV-derived offset.
+        """Build segments using CV peak detection with ordered matching.
 
-        Gemini returns accurate text and correctly-spaced bounding
-        boxes, but the absolute y-position is typically offset from
-        the real ink.  We detect the first ink peak near Gemini's
-        first entry and compute a constant vertical shift that
-        brings all boxes into alignment.
+        Gemini returns text in correct reading order but bounding boxes
+        can be unreliable (bunched together, overlapping).  We use
+        Gemini y-coordinates as approximate targets, enforce minimum
+        spacing between entries, then snap each target to the nearest
+        CV ink peak while maintaining monotonic order.
+
+        This handles both well-spaced coordinates (page 1) and
+        bunched/overlapping coordinates (page 2) correctly.
         """
         import cv2
 
@@ -867,133 +1303,180 @@ class GeminiOcrEngine:
             return []
 
         # ── Extract Gemini per-line coordinates ──────────────────────
-        gemini_y_top: list[int | None] = []
-        gemini_y_bot: list[int | None] = []
+        gemini_centers: list[int | None] = []
         per_line_x: list[tuple[int, int]] = []
-        x_min_all, x_max_all = img_width, 0
 
         if entries is not None:
             for e in entries:
-                if isinstance(e, dict) and isinstance(e.get("box"), list) and len(e["box"]) == 4:
-                    y1, x1, y2, x2 = e["box"]
+                box = e.get("box") or e.get("box_2d") if isinstance(e, dict) else None
+                if isinstance(box, list) and len(box) == 4:
+                    y1, x1, y2, x2 = box
                     yt = int(y1 / 1000.0 * img_height)
                     yb = int(y2 / 1000.0 * img_height)
-                    gemini_y_top.append(yt)
-                    gemini_y_bot.append(yb)
+                    gemini_centers.append((yt + yb) // 2)
                     px1 = max(0, int(x1 / 1000.0 * img_width))
                     px2 = min(img_width, int(x2 / 1000.0 * img_width))
                     per_line_x.append((px1, px2))
-                    x_min_all = min(x_min_all, px1)
-                    x_max_all = max(x_max_all, px2)
                 else:
-                    gemini_y_top.append(None)
-                    gemini_y_bot.append(None)
+                    gemini_centers.append(None)
                     per_line_x.append((0, img_width))
 
-        # Pad if fewer coords than text lines.
-        while len(gemini_y_top) < n:
-            gemini_y_top.append(None)
-            gemini_y_bot.append(None)
+        while len(gemini_centers) < n:
+            gemini_centers.append(None)
         while len(per_line_x) < n:
             per_line_x.append((0, img_width))
 
-        # ── Compute y-offset from CV projection ──────────────────────
-        # Build handwriting-only projection in the text column to find
-        # where ink actually starts, then shift Gemini boxes to match.
-        y_offset = 0
-        first_gc = None
+        # ── Build CV handwriting image (ruled lines removed) ─────────
+        gray = np.array(image.convert("L"))
+        img_h, img_w = gray.shape
+
+        _, binary = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+        line_len = max(img_w // 4, 100)
+        horiz_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT, (line_len, 1),
+        )
+        ruled = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
+        ruled = cv2.dilate(
+            ruled,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
+            iterations=1,
+        )
+        handwriting = cv2.subtract(binary, ruled)
+
+        expected_spacing = img_height / max(n + 2, 1)
+
+        # ── Per-entry projection cache ──────────────────────────────
+        # Cache projections by (x1, x2) so shared x-ranges are fast.
+        _proj_cache: dict[tuple[int, int], np.ndarray] = {}
+
+        def _get_proj(col_x1: int, col_x2: int) -> np.ndarray:
+            xpad = int(img_w * 0.02)
+            cx1 = max(0, col_x1 - xpad)
+            cx2 = min(img_w, col_x2 + xpad)
+            key = (cx1, cx2)
+            if key not in _proj_cache:
+                if cx2 <= cx1:
+                    _proj_cache[key] = np.zeros(img_h, dtype=np.float32)
+                else:
+                    p = handwriting[:, cx1:cx2].astype(
+                        np.float32,
+                    ).sum(axis=1) / 255.0
+                    p = cv2.GaussianBlur(
+                        p.reshape(-1, 1), (1, 15), 2,
+                    ).flatten()
+                    _proj_cache[key] = p
+            return _proj_cache[key]
+
+        # ── Greedy ordered matching ─────────────────────────────────
+        # For each entry in reading order:
+        # 1. Use Gemini center as target, enforce min spacing
+        # 2. Find nearest CV peak in that entry's x-range
+        # 3. Advance search window past the chosen peak
+
+        min_spacing = max(int(expected_spacing * 0.3), 10)
+        max_snap_dist = int(expected_spacing * 2)
+
+        assigned_centers: list[int] = []
+
         for i in range(n):
-            gt = gemini_y_top[i]
-            gb = gemini_y_bot[i]
-            if gt is not None and gb is not None:
-                first_gc = (gt + gb) // 2
-                break
+            gc = gemini_centers[i]
+            if gc is None:
+                if assigned_centers:
+                    gc = assigned_centers[-1] + int(expected_spacing)
+                else:
+                    gc = int(expected_spacing)
 
-        if first_gc is not None:
-            # Text column bounds.
-            if x_max_all <= x_min_all:
-                x_min_all, x_max_all = 0, img_width
-            pad_x = int(img_width * 0.03)
-            x_col_min = max(0, x_min_all - pad_x)
-            x_col_max = min(img_width, x_max_all + pad_x)
+            # Enforce minimum spacing from previous assignment.
+            if assigned_centers:
+                gc = max(gc, assigned_centers[-1] + min_spacing)
 
-            gray = np.array(image.convert("L"))
-            h, w = gray.shape
+            # Search for nearest peak in this entry's x-range.
+            lx1, lx2 = per_line_x[i]
+            proj = _get_proj(lx1, lx2)
+            thr = max(proj.max() * 0.08, 1.0)
 
-            _, binary = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-            )
-            line_len = max(w // 4, 100)
-            horiz_kernel = cv2.getStructuringElement(
-                cv2.MORPH_RECT, (line_len, 1),
-            )
-            ruled = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
-            ruled = cv2.dilate(
-                ruled,
-                cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
-                iterations=1,
-            )
-            handwriting = cv2.subtract(binary, ruled)
+            search_from = max(1, (assigned_centers[-1] + min_spacing) if assigned_centers else 0)
+            search_to = min(len(proj) - 1, gc + max_snap_dist)
 
-            proj = handwriting[:, x_col_min:x_col_max].astype(
-                np.float32,
-            ).sum(axis=1) / 255.0
-            proj = cv2.GaussianBlur(
-                proj.reshape(-1, 1), (1, 19), 3,
-            ).flatten()
-
-            threshold = max(proj.max() * 0.10, 1.0)
-
-            # Search for the nearest strong peak to the first Gemini
-            # entry center.  Look within ±100px of that position.
-            search_r = 100
-            s_top = max(0, first_gc - search_r)
-            s_bot = min(len(proj), first_gc + search_r)
-            best_peak = first_gc
-            best_dist = search_r + 1
-
-            for j in range(max(1, s_top), min(len(proj) - 1, s_bot)):
-                if (proj[j] > threshold
+            best_y = gc
+            best_dist = max_snap_dist + 1
+            for j in range(search_from, search_to):
+                if (proj[j] > thr
                         and proj[j] > proj[j - 1]
                         and proj[j] >= proj[j + 1]):
-                    d = abs(j - first_gc)
+                    d = abs(j - gc)
                     if d < best_dist:
                         best_dist = d
-                        best_peak = j
+                        best_y = j
 
-            y_offset = best_peak - first_gc
-            logger.info(
-                "CV offset: first_peak=%d, gemini_center=%d, "
-                "offset=%d, text_col x=%d-%d",
-                best_peak, first_gc, y_offset, x_col_min, x_col_max,
-            )
-        else:
-            h = img_height
+            # Enforce monotonic ordering.
+            if assigned_centers and best_y <= assigned_centers[-1]:
+                best_y = assigned_centers[-1] + min_spacing
 
-        # ── Build segments with offset Gemini coordinates ────────────
+            assigned_centers.append(best_y)
+
+        # ── Compute line height ──────────────────────────────────────
+        # Use expected_spacing (image height / entry count) which
+        # closely matches the actual line-to-line distance on the page.
+        typical_h = max(20, int(expected_spacing))
+
+        logger.info(
+            "CV alignment: %d entries, typical_h=%d, "
+            "first=%d, last=%d, expected_spacing=%.0f",
+            n, typical_h,
+            assigned_centers[0] if assigned_centers else -1,
+            assigned_centers[-1] if assigned_centers else -1,
+            expected_spacing,
+        )
+
+        # ── Build segments with per-line ink x-detection ────────────
+        # Gemini x-coordinates often include page margins.  For each
+        # line, detect the actual ink extent in the handwriting image
+        # to get tighter, more accurate x-bounds.
         segments: list[OcrSegment] = []
-        avg_line_h = max(img_height // max(n, 1), 30)
-
         for i, text in enumerate(text_lines):
-            lx1, lx2 = per_line_x[i]
-
-            gt = gemini_y_top[i]
-            gb = gemini_y_bot[i]
-            if gt is not None and gb is not None:
-                by = gt + y_offset
-                bh = gb - gt
-            else:
-                by = avg_line_h * i
-                bh = avg_line_h
-
-            # Clamp to image bounds.
+            center = assigned_centers[i]
+            bh = typical_h
+            by = center - bh // 2
             by = max(0, min(by, img_height - 1))
             bh = max(20, min(bh, img_height - by))
 
-            # Horizontal extent from Gemini + padding.
-            hpad = max(5, img_width // 200)
-            bx = max(0, lx1 - hpad)
-            bw = min(img_width, lx2 + hpad) - bx
+            lx1, lx2 = per_line_x[i]
+
+            # Detect actual ink extent in this line's y-range.
+            y_start = max(0, by)
+            y_end = min(img_h, by + bh)
+            if y_end > y_start:
+                # Search within Gemini's x-range ± 10% margin.
+                margin = max(int((lx2 - lx1) * 0.1), 20)
+                sx1 = max(0, lx1 - margin)
+                sx2 = min(img_w, lx2 + margin)
+                line_slice = handwriting[y_start:y_end, sx1:sx2]
+                col_sums = line_slice.astype(
+                    np.float32,
+                ).sum(axis=0) / 255.0
+                ink_thr = max(col_sums.max() * 0.1, 1.0)
+                ink_cols = np.where(col_sums >= ink_thr)[0]
+
+                if len(ink_cols) >= 5:
+                    # Use detected ink bounds with small padding.
+                    hpad = max(8, img_w // 300)
+                    bx = max(0, sx1 + int(ink_cols[0]) - hpad)
+                    bx_end = min(
+                        img_w, sx1 + int(ink_cols[-1]) + hpad,
+                    )
+                    bw = bx_end - bx
+                else:
+                    # Fallback to Gemini x-coords.
+                    hpad = max(5, img_w // 200)
+                    bx = max(0, lx1 - hpad)
+                    bw = min(img_w, lx2 + hpad) - bx
+            else:
+                hpad = max(5, img_w // 200)
+                bx = max(0, lx1 - hpad)
+                bw = min(img_w, lx2 + hpad) - bx
 
             segments.append(OcrSegment(
                 text=text,
@@ -1062,6 +1545,25 @@ class GeminiOcrEngine:
 
 # Singleton Gemini engine
 _gemini_engine: Optional[GeminiOcrEngine] = None
+def _text_overlap(a: str, b: str) -> float:
+    """Return word-level overlap ratio between two strings (0-1)."""
+    if not a or not b:
+        return 0.0
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    return len(intersection) / max(len(words_a), len(words_b))
+
+
+def _text_similar(expected: str, got: str, threshold: float = 0.4) -> bool:
+    """Check if OCR output is similar enough to expected text."""
+    if not expected or not got:
+        return False
+    return _text_overlap(expected, got) >= threshold
+
+
 _gemini_lock = threading.Lock()
 
 

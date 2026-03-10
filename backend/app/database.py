@@ -11,6 +11,7 @@ engine = create_async_engine(
     # aiosqlite does not support pool settings, but we set them for
     # forward-compatibility with PostgreSQL.
     pool_pre_ping=True,
+    connect_args={"timeout": 30},  # SQLite busy timeout (seconds)
 )
 
 async_session = async_sessionmaker(

@@ -39,8 +39,8 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
 
     from app.database import async_session  # local import to avoid circulars
     from app.ocr import (
-        deskew_page, detect_content_bounds, get_engine, get_gemini_engine,
-        has_gemini, perspective_warp_page, preprocess_image,
+        detect_content_bounds, get_engine, get_gemini_engine,
+        has_gemini, preprocess_image,
     )
     from app.routes.documents import _bake_rotation
     from app.routes.search import index_ocr_result
@@ -53,6 +53,14 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
         result = await db.execute(stmt)
         page = result.scalar_one_or_none()
         if page is None:
+            return
+
+        # Guard: verify image file exists before starting.
+        import os
+        if not os.path.exists(page.image_path):
+            logger.error("Page %d image missing: %s", page_id, page.image_path)
+            page.processing_status = "error"
+            await db.commit()
             return
 
         page.processing_status = "processing"
@@ -102,43 +110,56 @@ async def _run_ocr_on_page(page_id: int, user_id: int) -> None:
                         page.rotation = detected_rot  # flag: already rotated
                         await db.flush()
 
-                # Perspective warp: detect page corners and warp to
-                # extract just the page, removing desk/background.
+                # Perspective warp: detect page corners and crop to
+                # just the notebook page (removes desk, solar panels,
+                # hands, etc.).  Only runs once per page.
                 if not page.page_warped:
+                    from app.ocr import perspective_warp_page as _warp
                     warp_img = await asyncio.to_thread(
-                        preprocess_image, page.image_path, 0,
+                        _pi, page.image_path, 0,
                     )
                     corners = await asyncio.to_thread(
                         gemini.detect_page_corners, warp_img,
                     )
                     if corners is not None:
                         new_path = await asyncio.to_thread(
-                            perspective_warp_page, page.image_path, corners,
+                            _warp, page.image_path, corners,
                         )
                         if new_path is not None:
                             logger.info(
-                                "Page %d warped: %s → %s",
+                                "Perspective warp page %d: %s → %s",
                                 page_id, page.image_path, new_path,
                             )
                             page.image_path = new_path
-                            # Clear crop — it was relative to the old image.
-                            page.crop_x = None
-                            page.crop_y = None
-                            page.crop_w = None
-                            page.crop_h = None
-                    # Deskew: correct small text skew after warp.
-                    deskewed_path = await asyncio.to_thread(
-                        deskew_page, page.image_path,
-                    )
-                    if deskewed_path is not None:
-                        logger.info(
-                            "Page %d deskewed: %s → %s",
-                            page_id, page.image_path, deskewed_path,
-                        )
-                        page.image_path = deskewed_path
-
+                            # Clear any stale crop fields.
+                            page.crop_x = page.crop_y = None
+                            page.crop_w = page.crop_h = None
                     page.page_warped = 1
                     await db.flush()
+
+                # Deskew: straighten small text skew so horizontal
+                # bounding boxes align with the (now-horizontal) text.
+                from app.ocr import deskew_page as _deskew
+                deskewed = await asyncio.to_thread(
+                    _deskew, page.image_path,
+                )
+                if deskewed is not None:
+                    logger.info(
+                        "Deskew page %d: %s → %s",
+                        page_id, page.image_path, deskewed,
+                    )
+                    page.image_path = deskewed
+                    await db.flush()
+
+                # Commit image path changes immediately so other
+                # sessions see the correct (renamed) file path.
+                await db.commit()
+
+                # Re-read page to get the committed image_path.
+                result2 = await db.execute(
+                    select(Page).where(Page.id == page_id)
+                )
+                page = result2.scalar_one()
 
                 # Process with rotation=0 — file is already correctly
                 # oriented (either originally or after baking above).
@@ -370,8 +391,9 @@ async def process_bbox(
     doc_result = await db.execute(doc_stmt)
     document = doc_result.scalar_one_or_none()
 
-    # Load the image with rotation + crop applied.
-    image = preprocess_image(page.image_path, rotation=page.rotation)
+    # Load the image — file is already correctly oriented (rotation
+    # was baked by auto-rotate), so use rotation=0 to avoid double-rotating.
+    image = preprocess_image(page.image_path, rotation=0)
     if page.crop_x is not None and page.crop_y is not None and page.crop_w is not None and page.crop_h is not None:
         image = image.crop((page.crop_x, page.crop_y, page.crop_x + page.crop_w, page.crop_y + page.crop_h))
         crop_x_off = page.crop_x
@@ -520,3 +542,40 @@ async def processing_status(
         await db.flush()
 
     return ProcessingStatusResponse(pages=items)
+
+
+# ── Training mode ─────────────────────────────────────────────────────────────
+
+
+class UpdateBboxRequest(BaseModel):
+    bbox_x: int
+    bbox_y: int
+    bbox_w: int
+    bbox_h: int
+
+
+@router.put("/result/{result_id}/bbox", response_model=OcrResultOut)
+async def update_result_bbox(
+    result_id: int,
+    body: UpdateBboxRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> OcrResult:
+    """Update the bounding box of an existing OCR result (training mode)."""
+    stmt = (
+        select(OcrResult)
+        .join(Page, OcrResult.page_id == Page.id)
+        .join(Document, Page.document_id == Document.id)
+        .where(OcrResult.id == result_id, Document.user_id == current_user.id)
+    )
+    result = await db.execute(stmt)
+    ocr_row = result.scalar_one_or_none()
+    if ocr_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Result not found")
+
+    ocr_row.bbox_x = body.bbox_x
+    ocr_row.bbox_y = body.bbox_y
+    ocr_row.bbox_w = body.bbox_w
+    ocr_row.bbox_h = body.bbox_h
+    await db.flush()
+    return ocr_row

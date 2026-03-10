@@ -114,6 +114,16 @@ export async function processBbox(pageId, bbox) {
   return data;
 }
 
+export async function updateResultBbox(resultId, bbox) {
+  const { data } = await api.put(`/ocr/result/${resultId}/bbox`, {
+    bbox_x: bbox.x,
+    bbox_y: bbox.y,
+    bbox_w: bbox.w,
+    bbox_h: bbox.h,
+  });
+  return data;
+}
+
 export async function setPageCrop(pageId, bbox) {
   const { data } = await api.post(`/documents/pages/${pageId}/crop`, {
     crop_x: bbox.x,

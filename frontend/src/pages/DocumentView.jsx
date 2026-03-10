@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   getDocument, processDocument, processPage, getResults,
   submitCorrection, rotatePage, processBbox, setPageCrop, clearPageCrop,
-  autoCropPage, getProcessingStatus,
+  autoCropPage, getProcessingStatus, updateResultBbox,
 } from '../api';
 import { useToast } from '../hooks/useToast';
 import PageViewer from '../components/PageViewer';
@@ -19,6 +19,8 @@ export default function DocumentView() {
   const [selectedResultId, setSelectedResultId] = useState(null);
   const [drawMode, setDrawMode] = useState(false);
   const [cropMode, setCropMode] = useState(false);
+  const [trainMode, setTrainMode] = useState(false);
+  const [trainIndex, setTrainIndex] = useState(0);
 
   const { data: doc, isLoading: docLoading } = useQuery({
     queryKey: ['document', id],
@@ -180,13 +182,29 @@ export default function DocumentView() {
     },
   });
 
+  const trainBboxMutation = useMutation({
+    mutationFn: ({ resultId, bbox }) => updateResultBbox(resultId, bbox),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['ocrResults', currentPageId] });
+      setTrainIndex(prev => prev + 1);
+    },
+    onError: () => {
+      toast.error('Failed to save bbox.');
+    },
+  });
+
   const handleDrawBbox = useCallback((bbox) => {
-    if (cropMode) {
+    if (trainMode) {
+      const trainResult = results[trainIndex];
+      if (trainResult) {
+        trainBboxMutation.mutate({ resultId: trainResult.id, bbox });
+      }
+    } else if (cropMode) {
       setCropMutation.mutate(bbox);
     } else if (drawMode) {
       processBboxMutation.mutate(bbox);
     }
-  }, [cropMode, drawMode, setCropMutation, processBboxMutation]);
+  }, [trainMode, trainIndex, results, cropMode, drawMode, trainBboxMutation, setCropMutation, processBboxMutation]);
 
   const handleCorrect = (resultId, text) => {
     correctionMutation.mutate({ resultId, text });
@@ -200,7 +218,7 @@ export default function DocumentView() {
     if (selectedPageIndex < pages.length - 1) setSelectedPageIndex(selectedPageIndex + 1);
   };
 
-  const activeDrawMode = drawMode || cropMode;
+  const activeDrawMode = drawMode || cropMode || trainMode;
 
   const hasCrop = currentPage?.crop_x != null;
   const cropData = hasCrop ? {
@@ -352,9 +370,29 @@ export default function DocumentView() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                     </svg>
                   </button>
+                  {/* Train Boxes button */}
+                  {results.length > 0 && (
+                    <button
+                      onClick={() => {
+                        const next = !trainMode;
+                        setTrainMode(next);
+                        setDrawMode(false);
+                        setCropMode(false);
+                        if (next) setTrainIndex(0);
+                      }}
+                      className={`p-1 rounded transition-colors ${
+                        trainMode ? 'bg-purple-100 text-purple-600' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                      title={trainMode ? 'Exit training mode' : 'Train bounding boxes'}
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                      </svg>
+                    </button>
+                  )}
                   {/* Draw Box button */}
                   <button
-                    onClick={() => { setDrawMode(!drawMode); setCropMode(false); }}
+                    onClick={() => { setDrawMode(!drawMode); setCropMode(false); setTrainMode(false); }}
                     className={`p-1 rounded transition-colors ${
                       drawMode ? 'bg-blue-100 text-blue-600' : 'text-gray-500 hover:text-gray-700'
                     }`}
@@ -366,7 +404,7 @@ export default function DocumentView() {
                   </button>
                   {/* Crop button */}
                   <button
-                    onClick={() => { setCropMode(!cropMode); setDrawMode(false); }}
+                    onClick={() => { setCropMode(!cropMode); setDrawMode(false); setTrainMode(false); }}
                     className={`p-1 rounded transition-colors ${
                       cropMode ? 'bg-green-100 text-green-600' : 'text-gray-500 hover:text-gray-700'
                     }`}
@@ -414,10 +452,47 @@ export default function DocumentView() {
 
               {/* Active mode indicator */}
               {activeDrawMode && (
-                <div className={`px-4 py-1.5 text-xs font-medium ${
+                <div className={`px-4 py-2 text-sm font-medium ${
+                  trainMode ? 'bg-purple-50 text-purple-800' :
                   cropMode ? 'bg-green-50 text-green-700' : 'bg-blue-50 text-blue-700'
                 }`}>
-                  {cropMode ? 'Draw a rectangle to set the crop region' : 'Draw a rectangle to OCR that region'}
+                  {trainMode ? (
+                    trainIndex < results.length ? (
+                      <div className="flex items-center justify-between">
+                        <div className="flex-1 min-w-0">
+                          <span className="text-purple-500 text-xs">Line {trainIndex + 1} of {results.length} — draw a box around:</span>
+                          <div className="mt-0.5 font-semibold text-purple-900 truncate">
+                            &ldquo;{results[trainIndex]?.text}&rdquo;
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 ml-3 shrink-0">
+                          <button
+                            onClick={() => setTrainIndex(prev => Math.max(0, prev - 1))}
+                            disabled={trainIndex === 0}
+                            className="px-2 py-0.5 text-xs bg-purple-100 rounded disabled:opacity-30"
+                          >
+                            Prev
+                          </button>
+                          <button
+                            onClick={() => setTrainIndex(prev => prev + 1)}
+                            className="px-2 py-0.5 text-xs bg-purple-100 rounded"
+                          >
+                            Skip
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between">
+                        <span>All lines trained!</span>
+                        <button
+                          onClick={() => { setTrainMode(false); }}
+                          className="px-2 py-0.5 text-xs bg-purple-200 rounded"
+                        >
+                          Done
+                        </button>
+                      </div>
+                    )
+                  ) : cropMode ? 'Draw a rectangle to set the crop region' : 'Draw a rectangle to OCR that region'}
                 </div>
               )}
 
